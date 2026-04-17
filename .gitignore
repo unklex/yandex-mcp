@@ -1,0 +1,28 @@
+# Секреты и локальная конфигурация
+.env
+
+# Утилиты с захардкоженными токенами — только для локальной настройки
+setup_mcp.py
+update_token.py
+update_direct.py
+update_counter.py
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
