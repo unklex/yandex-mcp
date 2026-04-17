@@ -1,16 +1,20 @@
 """
 Асинхронный клиент Yandex Direct API v5.
 
-Базовые URL:
-  Кампании:  https://api.direct.yandex.com/v501/campaigns
-  Отчёты:    https://api.direct.yandex.com/v501/reports  (async polling, TSV)
+Базовые URL (официальные, по документации https://yandex.ru/dev/direct/doc/):
+  JSON API:  https://api.direct.yandex.com/json/v5/{campaigns,ads,adgroups,bids,...}
+  Отчёты:    https://api.direct.yandex.com/json/v5/reports  (polling-TSV)
 
 Отличие от Metrica:
-  - Auth header: Authorization: Bearer {token}  (не OAuth)
+  - Auth header: Authorization: Bearer {token}
   - Client-Login — HTTP-заголовок для агентских аккаунтов
   - Reports API возвращает TSV, использует polling (201/202 → 200)
+  - Reports API требует заголовок processingMode (online/offline/auto)
+  - Тело запроса Reports API: {"params": {"SelectionCriteria": ..., "FieldNames": ...}}
+    БЕЗ обёртки ReportDefinition (типовая ошибка, приводящая к 400).
+  - DateFrom/DateTo при CUSTOM_DATE идут ВНУТРЬ SelectionCriteria, не в корень.
   - Ошибки Reports API — XML или plain text (не JSON)
-  - Суммы в микро-рублях (÷ 1_000_000 = рубли)
+  - Суммы в микро-рублях (÷ 1_000_000 = рубли) при returnMoneyInMicros по умолчанию
 """
 
 from __future__ import annotations
@@ -19,11 +23,12 @@ import asyncio
 import csv
 import io
 import re
+import uuid
 from typing import Any
 
 import httpx
 
-_DIRECT_BASE = "https://api.direct.yandex.com/v501"
+_DIRECT_BASE = "https://api.direct.yandex.com/json/v5"
 _REPORTS_URL = f"{_DIRECT_BASE}/reports"
 _CAMPAIGNS_URL = f"{_DIRECT_BASE}/campaigns"
 _ADS_URL = f"{_DIRECT_BASE}/ads"
@@ -172,30 +177,97 @@ class DirectClient:
 
         raise last_exc or DirectAPIError(0, "Неизвестная ошибка при запросе к Яндекс.Директу")
 
+    @staticmethod
+    def _report_headers(client_login: str | None) -> dict[str, str]:
+        """
+        Спец-заголовки Reports API. processingMode ОБЯЗАТЕЛЕН — без него API
+        возвращает 400 "Invalid request" (error_code 8000) без деталей.
+
+        processingMode=auto: сервер сам выбирает online/offline в зависимости от
+        объёма; это снимает нужду в polling для маленьких отчётов и
+        автоматически очередирует большие.
+        """
+        headers: dict[str, str] = {
+            "processingMode": "auto",
+            # Включаем описательные строки — _parse_tsv их фильтрует.
+            # (оставляем skipReportHeader=false для удобной отладки;
+            #  чтобы полностью выключить их — поставьте "true")
+            "skipReportHeader": "true",
+            "skipReportSummary": "true",
+        }
+        if client_login:
+            headers["Client-Login"] = client_login
+        return headers
+
+    @staticmethod
+    def _extract_report_error(resp: httpx.Response) -> str:
+        """
+        Вытаскивает error_detail/error_code из ответа Reports API.
+        На практике 400 приходит в JSON: {"error":{"error_code":..., "error_detail":...}};
+        старые версии документации упоминают XML — обрабатываем оба варианта.
+        """
+        # requests/httpx декодируют тело по Content-Type — но Direct иногда отдаёт
+        # кириллический detail без явной кодировки; перечитываем bytes как UTF-8.
+        try:
+            text = resp.content.decode("utf-8", errors="replace")
+        except Exception:
+            text = resp.text
+
+        try:
+            import json as _json
+            data = _json.loads(text)
+            err = data.get("error", {}) if isinstance(data, dict) else {}
+            code = err.get("error_code", "")
+            detail = err.get("error_detail", "") or err.get("error_string", "")
+            if code or detail:
+                return f"код {code} — {detail}" if code else detail
+        except (ValueError, TypeError):
+            pass
+
+        m_detail = re.search(r"<error_detail>(.*?)</error_detail>", text, re.DOTALL)
+        m_code = re.search(r"<error_code>(.*?)</error_code>", text, re.DOTALL)
+        m_msg = re.search(r"<error_message>(.*?)</error_message>", text, re.DOTALL)
+        parts: list[str] = []
+        if m_code:
+            parts.append(f"код {m_code.group(1).strip()}")
+        if m_msg:
+            parts.append(m_msg.group(1).strip())
+        if m_detail:
+            d = m_detail.group(1).strip()
+            if d:
+                parts.append(d)
+        if parts:
+            return " — ".join(parts)
+        return text[:400] if text else "пустое тело ответа"
+
     async def _post_report(
         self,
         payload: dict[str, Any],
         top_n: int | None = None,
+        client_login: str | None = None,
     ) -> list[dict[str, str]]:
         """
         POST к Reports API с polling-моделью.
 
         Алгоритм:
-          1. POST запроса отчёта
-          2. Если 201 (в очереди) или 202 (обрабатывается) → ждём retryIn секунд (из заголовка)
-             и повторяем (до _MAX_POLL_RETRIES раз)
-          3. Если 200 → парсим TSV через _parse_tsv(text, top_n)
-          4. Если 400 → извлекаем ошибку из XML или plain text (не JSON!)
-
-        Динамическая задержка: берём из заголовка retryIn (не хардкодим!).
+          1. POST с заголовками processingMode/skipReportHeader/Client-Login
+          2. 200 → TSV готов, парсим
+          3. 201 (в очереди) или 202 (обрабатывается) → ждём retryIn секунд и повторяем
+          4. 400 → извлекаем ошибку из XML (<error_code>, <error_detail>)
+          5. 500/502/503/504 → retry с экспоненциальным backoff (до _MAX_RETRIES)
         """
         assert self._client is not None, (
             "Клиент не инициализирован. Используйте: async with DirectClient(...) as client"
         )
 
+        extra_headers = self._report_headers(client_login)
+        transient_retries = 0
+
         for attempt in range(_MAX_POLL_RETRIES):
             try:
-                resp = await self._client.post(_REPORTS_URL, json=payload)
+                resp = await self._client.post(
+                    _REPORTS_URL, json=payload, headers=extra_headers
+                )
             except httpx.RequestError as exc:
                 raise DirectAPIError(0, f"Сетевая ошибка при запросе отчёта Директа: {exc}") from exc
 
@@ -206,20 +278,18 @@ class DirectClient:
 
             if resp.status_code in (201, 202):
                 # 201 = поставлен в очередь, 202 = обрабатывается
-                # retryIn — рекомендуемый интервал повтора в секундах
                 retry_in = int(resp.headers.get("retryIn", "5"))
                 await asyncio.sleep(min(retry_in, 60))
                 continue
 
             if resp.status_code == 400:
-                # Reports API возвращает ошибку в XML или plain text, НЕ в JSON
-                content_type = resp.headers.get("Content-Type", "")
-                if "xml" in content_type.lower():
-                    match = re.search(r"<error_detail>(.*?)</error_detail>", resp.text, re.DOTALL)
-                    detail = match.group(1).strip() if match else resp.text[:400]
-                else:
-                    detail = resp.text[:400]
+                detail = self._extract_report_error(resp)
                 raise DirectAPIError(400, f"Неверные параметры отчёта Яндекс.Директа: {detail}")
+
+            if resp.status_code in _RETRY_STATUSES and transient_retries < _MAX_RETRIES - 1:
+                transient_retries += 1
+                await asyncio.sleep(2**transient_retries)
+                continue
 
             raise DirectAPIError(resp.status_code, self._status_message(resp))
 
@@ -478,27 +548,37 @@ class DirectClient:
         date_range_type: str,
         report_name: str,
         *,
+        report_type: str = "CUSTOM_REPORT",
         date_from: str | None = None,
         date_to: str | None = None,
         campaign_ids: list[int] | None = None,
         order_by: str | None = None,
+        sort_order: str = "DESCENDING",
         top_n: int | None = None,
+        include_vat: str = "NO",
         client_login: str | None = None,
     ) -> list[dict[str, str]]:
         """
-        Запросить статистический отчёт через Reports API (async polling).
+        Запросить статистический отчёт через Reports API (polling).
 
         Параметры:
         - field_names:      список полей отчёта (измерения + метрики)
-        - date_range_type:  LAST_7_DAYS | LAST_30_DAYS | THIS_MONTH | LAST_MONTH | CUSTOM_DATE
-        - report_name:      произвольное имя отчёта
+        - date_range_type:  TODAY | YESTERDAY | LAST_7_DAYS | LAST_30_DAYS |
+                            THIS_MONTH | LAST_MONTH | ALL_TIME | CUSTOM_DATE ...
+        - report_name:      человекочитаемое имя; к нему добавляется uuid — Direct
+                            кэширует ответы по ReportName и требует уникальности
+                            при изменении параметров.
+        - report_type:      CUSTOM_REPORT (по умолчанию — максимальная гибкость),
+                            ACCOUNT_PERFORMANCE_REPORT, CAMPAIGN_PERFORMANCE_REPORT,
+                            ADGROUP_PERFORMANCE_REPORT, AD_PERFORMANCE_REPORT,
+                            SEARCH_QUERY_PERFORMANCE_REPORT, REACH_AND_FREQUENCY_PERFORMANCE_REPORT
         - date_from/to:     обязательны при CUSTOM_DATE, формат YYYY-MM-DD
-        - campaign_ids:     фильтр по ID кампаний (SelectionCriteria, не Filter)
-        - order_by:         поле сортировки (нисходящий порядок)
-        - top_n:            ограничение строк при парсинге TSV (экономия памяти)
-        - client_login:     переопределение Client-Login для этого запроса
-
-        Возвращает list[dict[str, str]] — строки отчёта в виде словарей.
+        - campaign_ids:     фильтр по ID кампаний (внутри SelectionCriteria)
+        - order_by:         поле сортировки
+        - sort_order:       ASCENDING или DESCENDING
+        - top_n:            ограничение строк при парсинге TSV
+        - include_vat:      YES/NO — учитывать ли НДС в суммах
+        - client_login:     логин клиента для агентских аккаунтов
         """
         if date_range_type == "CUSTOM_DATE":
             if not date_from or not date_to:
@@ -507,59 +587,44 @@ class DirectClient:
                     "При date_range_type=CUSTOM_DATE необходимо указать date_from и date_to (YYYY-MM-DD).",
                 )
 
-        report_def: dict[str, Any] = {
-            "ReportName": report_name,
-            "ReportType": "CUSTOM_REPORT",
+        # DateFrom/DateTo + фильтры по кампаниям — ВНУТРИ SelectionCriteria.
+        # (старый код клал их в корень ReportDefinition → 400 error_code 8000.)
+        #
+        # Внимание: у Reports API v5 СВОЯ SelectionCriteria — не такая, как у
+        # JSON API (campaigns.get принимает CampaignIds напрямую, Reports — нет).
+        # Фильтрация по кампаниям делается через Filter[].Field=CampaignId,
+        # Operator=IN, Values=[строки-id]. Values должны быть строками.
+        selection: dict[str, Any] = {}
+        if date_range_type == "CUSTOM_DATE":
+            selection["DateFrom"] = date_from
+            selection["DateTo"] = date_to
+        if campaign_ids:
+            selection["Filter"] = [{
+                "Field": "CampaignId",
+                "Operator": "IN",
+                "Values": [str(cid) for cid in campaign_ids],
+            }]
+
+        # Уникальное имя — иначе Direct может вернуть кэшированный отчёт
+        # с несовпадающей схемой полей.
+        unique_name = f"{report_name}_{uuid.uuid4().hex[:8]}"
+
+        # ВАЖНО: поля идут напрямую под params, без обёртки ReportDefinition.
+        # Старый код: {"params": {"ReportDefinition": {...}}}  ← вызывал 400
+        # Правильно: {"params": {"SelectionCriteria": ..., "FieldNames": ..., ...}}
+        params: dict[str, Any] = {
+            "SelectionCriteria": selection,
+            "FieldNames": field_names,
+            "ReportName": unique_name,
+            "ReportType": report_type,
             "DateRangeType": date_range_type,
             "Format": "TSV",
-            "IncludeVAT": "NO",
-            "IncludeDiscount": "NO",
-            "FieldNames": field_names,
-            "SelectionCriteria": {},
+            "IncludeVAT": include_vat,
         }
 
-        if date_range_type == "CUSTOM_DATE":
-            report_def["DateFrom"] = date_from
-            report_def["DateTo"] = date_to
-
-        # Используем SelectionCriteria.CampaignIds для фильтрации (не Filter)
-        if campaign_ids:
-            report_def["SelectionCriteria"] = {"CampaignIds": campaign_ids}
-
         if order_by:
-            report_def["OrderBy"] = [{"Field": order_by, "SortOrder": "DESCENDING"}]
+            params["OrderBy"] = [{"Field": order_by, "SortOrder": sort_order}]
 
-        payload: dict[str, Any] = {"params": {"ReportDefinition": report_def}}
+        payload: dict[str, Any] = {"params": params}
 
-        # Если задан client_login для этого запроса — добавляем через заголовок
-        if client_login:
-            assert self._client is not None
-            extra_headers = {"Client-Login": client_login}
-            # Временно добавляем через отдельный метод с заголовком
-            for attempt in range(_MAX_POLL_RETRIES):
-                try:
-                    resp = await self._client.post(_REPORTS_URL, json=payload, headers=extra_headers)
-                except httpx.RequestError as exc:
-                    raise DirectAPIError(0, f"Сетевая ошибка: {exc}") from exc
-
-                self._parse_units(resp)
-
-                if resp.status_code == 200:
-                    return self._parse_tsv(resp.text, top_n=top_n)
-                if resp.status_code in (201, 202):
-                    retry_in = int(resp.headers.get("retryIn", "5"))
-                    await asyncio.sleep(min(retry_in, 60))
-                    continue
-                if resp.status_code == 400:
-                    content_type = resp.headers.get("Content-Type", "")
-                    if "xml" in content_type.lower():
-                        match = re.search(r"<error_detail>(.*?)</error_detail>", resp.text, re.DOTALL)
-                        detail = match.group(1).strip() if match else resp.text[:400]
-                    else:
-                        detail = resp.text[:400]
-                    raise DirectAPIError(400, f"Неверные параметры отчёта: {detail}")
-                raise DirectAPIError(resp.status_code, self._status_message(resp))
-
-            raise DirectAPIError(0, "Отчёт не был готов после максимального числа попыток.")
-
-        return await self._post_report(payload, top_n=top_n)
+        return await self._post_report(payload, top_n=top_n, client_login=client_login)

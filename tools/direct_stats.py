@@ -2,8 +2,9 @@
 Инструменты Яндекс.Директ — статистика эффективности и ключевые фразы.
 
 Инструменты:
-  - get_direct_performance — клики, показы, расход, CTR, CPC, конверсии, ROI
-  - get_direct_keywords    — топ ключевых фраз по расходу или кликам
+  - get_direct_performance     — клики, показы, расход, CTR, CPC, конверсии, ROI
+  - get_direct_keywords        — топ ключевых фраз по расходу или кликам
+  - get_direct_search_queries  — реальные поисковые запросы пользователей
 """
 
 from __future__ import annotations
@@ -283,14 +284,21 @@ async def get_direct_keywords(
 
     try:
         rows = await direct.get_report(
-            field_names=["Keyword", "CampaignId", "CampaignName", "Clicks", "Impressions", "Cost", "Ctr", "AvgCpc"],
+            # В CUSTOM_REPORT поле Keyword невалидно (ошибка 4000). Используем
+            # Criterion + CriterionType — это современная схема Direct, где
+            # ключевая фраза — один из типов таргетинга (KEYWORD).
+            field_names=[
+                "Criterion", "CriterionType", "CriterionId",
+                "CampaignId", "CampaignName",
+                "Clicks", "Impressions", "Cost", "Ctr", "AvgCpc",
+            ],
             date_range_type=date_range,
             report_name="keywords",
             date_from=date_from,
             date_to=date_to,
             campaign_ids=parsed_ids,
             order_by=sort_by,
-            top_n=top_n,   # early-exit в _parse_tsv — экономим память
+            top_n=None,  # top_n применим после фильтра по CriterionType
             client_login=client_login,
         )
     except DirectAPIError as e:
@@ -302,11 +310,16 @@ async def get_direct_keywords(
             ensure_ascii=False,
         )
 
+    # Оставляем только KEYWORD — без автотаргетов, ретаргетинга и т.п.
+    keyword_rows = [r for r in rows if r.get("CriterionType") == "KEYWORD"] or rows
+
     keywords = []
-    for row in rows:
+    for row in keyword_rows[:top_n]:
         m = format_metrics(row)
         keywords.append({
-            "keyword": row.get("Keyword", "—"),
+            "keyword": row.get("Criterion", "—"),
+            "criterion_type": row.get("CriterionType", "—"),
+            "criterion_id": row.get("CriterionId", "—"),
             "campaign_id": row.get("CampaignId", "—"),
             "campaign_name": row.get("CampaignName", "—"),
             "clicks": _safe_int(m.get("Clicks")),
@@ -326,6 +339,121 @@ async def get_direct_keywords(
         "sort_by": sort_by,
         "returned_rows": len(keywords),
         "keywords": keywords,
+    }
+    if date_from and date_to:
+        result["period"] = {"from": date_from, "to": date_to}
+    if parsed_ids:
+        result["filtered_campaign_ids"] = parsed_ids
+
+    warning = direct.units_warning()
+    if warning:
+        result["_units_warning"] = warning
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_direct_search_queries(
+    ctx: Context,
+    date_range: str = "LAST_30_DAYS",
+    sort_by: str = "Cost",
+    top_n: int = 30,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    campaign_ids: Optional[str] = None,
+    account: Optional[str] = None,
+    client_login: Optional[str] = None,
+) -> str:
+    """
+    Получить отчёт по реальным поисковым запросам пользователей, по которым
+    показывались объявления (SEARCH_QUERY_PERFORMANCE_REPORT).
+
+    Позволяет найти:
+    - Запросы с кликами, но без конверсий — кандидаты в минус-слова.
+    - Запросы с высоким CTR и низким CPC — кандидаты в новые ключевые фразы.
+    - Нерелевантные запросы, по которым реклама показывается ошибочно.
+
+    Параметры:
+    - date_range:   LAST_7_DAYS, LAST_30_DAYS, THIS_MONTH, LAST_MONTH, CUSTOM_DATE
+    - sort_by:      Cost (расход) или Clicks (клики). По умолчанию Cost.
+    - top_n:        количество запросов в результате (по умолчанию 30)
+    - date_from/to: даты YYYY-MM-DD при CUSTOM_DATE
+    - campaign_ids: ID кампаний через запятую (необязательно)
+    - account:      псевдоним аккаунта Директа (необязательно)
+    - client_login: логин клиента для агентских аккаунтов (необязательно)
+
+    Возвращает JSON. Суммы расходов в рублях без НДС.
+    """
+    lc = ctx.request_context.lifespan_context
+    direct = resolve_direct_client(account, lc)
+    if direct is None:
+        return _no_direct_error(account)
+
+    if date_range not in _VALID_RANGES:
+        return json.dumps(
+            {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."},
+            ensure_ascii=False,
+        )
+    if sort_by not in ("Cost", "Clicks"):
+        return json.dumps(
+            {"error": "Параметр sort_by должен быть 'Cost' (расход) или 'Clicks' (клики)."},
+            ensure_ascii=False,
+        )
+
+    parsed_ids, err = _parse_campaign_ids(campaign_ids)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False)
+
+    try:
+        rows = await direct.get_report(
+            # Query — реальный запрос пользователя; Criterion — ключевая фраза, на которую сработало.
+            field_names=[
+                "Query", "Criterion", "CampaignId", "CampaignName",
+                "Clicks", "Impressions", "Cost", "Ctr", "AvgCpc",
+            ],
+            date_range_type=date_range,
+            report_name="search_queries",
+            report_type="SEARCH_QUERY_PERFORMANCE_REPORT",
+            date_from=date_from,
+            date_to=date_to,
+            campaign_ids=parsed_ids,
+            order_by=sort_by,
+            top_n=top_n,
+            client_login=client_login,
+        )
+    except DirectAPIError as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    if not rows:
+        return json.dumps(
+            {"error": f"Нет данных по поисковым запросам за период {date_range}."},
+            ensure_ascii=False,
+        )
+
+    queries = []
+    for row in rows:
+        m = format_metrics(row)
+        queries.append({
+            "query": row.get("Query", "—"),
+            "matched_keyword": row.get("Criterion", "—"),
+            "campaign_id": row.get("CampaignId", "—"),
+            "campaign_name": row.get("CampaignName", "—"),
+            "clicks": _safe_int(m.get("Clicks")),
+            "impressions": _safe_int(m.get("Impressions")),
+            "cost_rub": _safe_float(m.get("Cost")),
+            "ctr_pct": _safe_float(m.get("Ctr")),
+            "avg_cpc_rub": _safe_float(m.get("AvgCpc")),
+        })
+
+    sort_key = "cost_rub" if sort_by == "Cost" else "clicks"
+    queries.sort(key=lambda x: x[sort_key], reverse=True)
+
+    result: dict = {
+        "account": account or "primary",
+        "date_range": date_range,
+        "sort_by": sort_by,
+        "returned_rows": len(queries),
+        "search_queries": queries,
     }
     if date_from and date_to:
         result["period"] = {"from": date_from, "to": date_to}
