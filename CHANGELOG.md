@@ -4,6 +4,99 @@
 
 ---
 
+## [1.3.0] — 2026-04-19
+
+### Добавлено
+
+#### Яндекс.Директ — 10 новых инструментов (write-операции + Wordstat + гибкие отчёты)
+
+**`tools/direct_campaigns.py`** — один новый write-инструмент:
+- `add_direct_negative_keywords` — добавить/заменить минус-фразы на уровне кампании.
+  Сам определяет подтип кампании (TextCampaign / DynamicTextCampaign / UnifiedCampaign /
+  SmartCampaign / MobileAppCampaign / MCBannerCampaign), читает существующий список,
+  делает case-insensitive merge (`append`) или полную замену (`replace`).
+
+**`tools/direct_negative_kw_sets.py`** — общие наборы минус-фраз (`NegativeKeywordSharedSets`),
+полный CRUD:
+- `get_negative_keyword_sets` — список наборов с фразами и `SharedAccountId`
+- `add_negative_keyword_set` — создание нового набора (с дедупликацией фраз)
+- `update_negative_keyword_set` — смена имени и/или полная замена списка фраз
+  (хотя бы один параметр обязателен)
+- `delete_negative_keyword_sets` — удаление по списку ID, с per-ID детализацией ошибок
+
+**`tools/wordstat.py`** — исследование ключевых фраз через legacy API v4
+(`https://api.direct.yandex.ru/live/v4/json/`), polling-модель:
+- `wordstat_top_requests` — топ смежных запросов (`SearchedWith`) по 1–10 фразам,
+  с фильтром по `GeoID`
+- `wordstat_dynamics` — помесячная динамика показов (`MonthList`) за ~24 месяца,
+  с min/max/avg в summary
+- `wordstat_regions` — распределение показов по регионам (`GeoList`) с `ShowsPercent`
+
+**`tools/direct_campaign_stats.py`** — углублённая статистика через Reports API:
+- `get_campaign_stats` — `CAMPAIGN_PERFORMANCE_REPORT` по заданным `campaign_ids`
+  за произвольный период с суммирующей строкой `totals` (пересчитанные CTR/CPC)
+- `get_custom_report` — универсальный отчёт: любой `report_type`
+  (CAMPAIGN/AD/ADGROUP/CRITERIA/SEARCH_QUERY/ACCOUNT/CUSTOM/REACH_AND_FREQUENCY),
+  произвольные `fields`, фильтр по кампаниям, подсказки по полям для каждого типа
+
+**`direct_client.py`** — новые методы и константы:
+- `_post_json_with_login(url, payload, client_login)` — общая обёртка с per-request
+  Client-Login override (устраняет дублирование в `get_campaigns`/`get_ads`/…)
+- `set_campaign_negative_keywords(campaign_id, keywords, mode, client_login)` —
+  read-modify-write для кампаний с определением подтипа и режимами `append`/`replace`
+- `_post_negative_kw_sets(payload, client_login)` — обёртка для сервиса
+  `/json/v5/negativekeywordsharedsets`
+- `_wordstat_request(method, param, client_login)` — единый POST к Wordstat v4
+  (обрабатывает `{"error_code": N, "error_str": ...}` внутри 200-ответа)
+- `_wordstat_poll(report_id, client_login)` — опрос `GetWordstatReport` до готовности
+  (до 10 попыток × 3 с)
+- Новые URL/лимиты: `_NEGATIVE_KW_SETS_URL`, `_WORDSTAT_URL`, `_WORDSTAT_MAX_POLLS`,
+  `_WORDSTAT_POLL_SLEEP`
+- Словарь `_NEGATIVE_KEYWORDS_SUBTYPES` — маппинг `Type` → PascalCase-ключ подтипа
+
+**`server.py`** — зарегистрированы модули `direct_negative_kw_sets`, `wordstat`,
+`direct_campaign_stats`
+
+**`test_direct.py`** — три новых standalone-валидатора:
+- `list_negative_keyword_sets(token, client_login)` — read-only probe сервиса
+  общих наборов
+- `wordstat_top(token, phrases, geo_ids, client_login)` — полный create→poll цикл
+  Wordstat v4
+- `custom_report(token, report_type, fields, ...)` — произвольный отчёт через
+  существующий `call_report`
+- Вызовы добавлены в `main()` (шаги 7, 8, 9)
+
+### Итого инструментов
+
+| Категория | Инструменты |
+|-----------|-------------|
+| Метрика | 7 |
+| Директ — кампании и бюджет | 3 |
+| Директ — эффективность и ключи | 3 |
+| Директ — разрезы статистики | 4 |
+| Директ — объявления, группы, ставки | 3 |
+| Директ — write-операции с минус-фразами | 1 (новый) |
+| Директ — общие наборы минус-фраз (CRUD) | 4 (новые) |
+| Директ — Wordstat v4 | 3 (новые) |
+| Директ — гибкие отчёты | 2 (новые) |
+| **Всего** | **30** |
+
+### Архитектурные заметки
+
+- **Write-операции**: первые в проекте. Паттерн read-modify-write для кампаний —
+  сначала получаем `Type` и текущий `NegativeKeywords.Items` через `campaigns.get`
+  со всеми `*FieldNames: [NegativeKeywords]`, затем шлём `campaigns.update` с
+  корректным PascalCase-ключом подтипа.
+- **Wordstat — отдельная legacy-подсистема**: другой домен (`.yandex.ru`, не `.com`),
+  другая версия API (v4, не v5), другой транспорт ошибок (JSON-поля в 200-ответе,
+  а не HTTP-коды). Реализовано поверх того же `httpx.AsyncClient`, чтобы не плодить
+  пулы соединений.
+- **Parser utilities**: во всех новых файлах общий паттерн разбора входных строк
+  через `re.split(r"[,;]\s*", ...)` с case-insensitive дедупликацией. Поддерживаются
+  и запятые, и точки с запятой.
+
+---
+
 ## [1.2.0] — 2026-04-17
 
 ### Добавлено
