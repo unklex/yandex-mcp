@@ -2,14 +2,16 @@
 Инструменты Яндекс.Директ — кампании и бюджет.
 
 Инструменты:
-  - get_direct_campaigns      — список кампаний со статусом и дневным бюджетом
-  - get_direct_top_campaigns  — топ-N кампаний по расходу или кликам за период
-  - get_direct_budget         — остаток баллов API и сводка дневных бюджетов
+  - get_direct_campaigns          — список кампаний со статусом и дневным бюджетом
+  - get_direct_top_campaigns      — топ-N кампаний по расходу или кликам за период
+  - get_direct_budget             — остаток баллов API и сводка дневных бюджетов
+  - add_direct_negative_keywords  — добавить/заменить минус-фразы на уровне кампании
 """
 
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 from mcp.server.fastmcp import Context
@@ -299,6 +301,94 @@ async def get_direct_budget(
             "daily_limit": units["daily"],
             "remaining_pct": round(units["available"] / units["daily"] * 100, 1) if units["daily"] > 0 else 0.0,
         }
+
+    warning = direct.units_warning()
+    if warning:
+        result["_units_warning"] = warning
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def add_direct_negative_keywords(
+    ctx: Context,
+    campaign_id: int,
+    keywords: str,
+    mode: str = "append",
+    account: Optional[str] = None,
+    client_login: Optional[str] = None,
+) -> str:
+    """
+    Добавить или заменить минус-фразы на уровне рекламной кампании Яндекс.Директа.
+
+    Поддерживаются типы кампаний: TEXT_CAMPAIGN (Текстово-графические),
+    DYNAMIC_TEXT_CAMPAIGN (Динамические), UNIFIED_CAMPAIGN (Мастер кампаний /
+    единая перформанс с автотаргетингом), SMART_CAMPAIGN (Смарт-баннеры),
+    MOBILE_APP_CAMPAIGN (Реклама приложений), MCBANNER_CAMPAIGN (Медийная).
+
+    Параметры:
+    - campaign_id:  ID кампании (число). Получить можно через get_direct_campaigns.
+    - keywords:     минус-фразы через запятую или точку с запятой.
+                    Пример: 'диван, пианино, ресторан, вывоз бытовых'.
+                    Допускаются пробелы вокруг; дубли игнорируются.
+    - mode:         'append' (по умолчанию) — добавить к существующим без дублей
+                    (case-insensitive), 'replace' — перезаписать весь список.
+    - account:      псевдоним аккаунта Директа (необязательно)
+    - client_login: логин клиента для агентских аккаунтов (необязательно)
+
+    Лимиты Директа: до 1000 минус-фраз на кампанию, суммарно до 20 000 символов,
+    каждая фраза — не более 7 слов. При нарушении API вернёт ошибку 400 с деталями.
+
+    Возвращает JSON со сводкой: тип кампании, было/стало/добавлено, полный новый
+    список. При ответе пользователю ВСЕГДА форматируй как читаемый отчёт Markdown
+    на русском — покажи было N → стало M, добавленные фразы отдельным блоком.
+    """
+    lc = ctx.request_context.lifespan_context
+    direct = resolve_direct_client(account, lc)
+    if direct is None:
+        return _no_direct_error(account)
+
+    if mode not in ("append", "replace"):
+        return json.dumps(
+            {"error": f"Параметр mode должен быть 'append' или 'replace', получено: «{mode}»."},
+            ensure_ascii=False,
+        )
+
+    # Разбор фраз: поддерживаем и запятые, и точки с запятой. Пустые — отбрасываем,
+    # дубли внутри входа — тоже (первое вхождение).
+    raw_parts = re.split(r"[,;]\s*", keywords or "")
+    seen: set[str] = set()
+    parsed: list[str] = []
+    for p in raw_parts:
+        s = p.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        parsed.append(s)
+
+    if not parsed:
+        return json.dumps(
+            {"error": "Параметр keywords пуст. Укажите минус-фразы через запятую."},
+            ensure_ascii=False,
+        )
+
+    try:
+        summary = await direct.set_campaign_negative_keywords(
+            campaign_id=campaign_id,
+            keywords=parsed,
+            mode=mode,
+            client_login=client_login,
+        )
+    except DirectAPIError as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    result: dict = {
+        "account": account or "primary",
+        **summary,
+    }
 
     warning = direct.units_warning()
     if warning:

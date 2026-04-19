@@ -29,10 +29,13 @@ import tools.goals     # noqa: F401, E402
 import tools.audience  # noqa: F401, E402
 import tools.realtime  # noqa: F401, E402
 import tools.compare          # noqa: F401, E402
-import tools.direct_campaigns  # noqa: F401, E402
-import tools.direct_stats      # noqa: F401, E402
-import tools.direct_reports    # noqa: F401, E402
-import tools.direct_ads        # noqa: F401, E402
+import tools.direct_campaigns          # noqa: F401, E402
+import tools.direct_stats               # noqa: F401, E402
+import tools.direct_reports             # noqa: F401, E402
+import tools.direct_ads                 # noqa: F401, E402
+import tools.direct_negative_kw_sets    # noqa: F401, E402
+import tools.wordstat                   # noqa: F401, E402
+import tools.direct_campaign_stats      # noqa: F401, E402
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

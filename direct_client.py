@@ -34,6 +34,13 @@ _CAMPAIGNS_URL = f"{_DIRECT_BASE}/campaigns"
 _ADS_URL = f"{_DIRECT_BASE}/ads"
 _ADGROUPS_URL = f"{_DIRECT_BASE}/adgroups"
 _BIDS_URL = f"{_DIRECT_BASE}/bids"
+_NEGATIVE_KW_SETS_URL = f"{_DIRECT_BASE}/negativekeywordsharedsets"
+
+# Wordstat — legacy API v4: https://yandex.ru/dev/direct/doc/dg-v4/reference/CreateNewWordstatReport
+# Единый эндпоинт, методы переключаются через поле "method" в теле.
+_WORDSTAT_URL = "https://api.direct.yandex.ru/live/v4/json/"
+_WORDSTAT_MAX_POLLS = 10
+_WORDSTAT_POLL_SLEEP = 3.0
 
 _MAX_RETRIES = 3
 _MAX_POLL_RETRIES = 30
@@ -359,6 +366,279 @@ class DirectClient:
             return data
 
         return await self._post_json(_CAMPAIGNS_URL, payload)
+
+    async def _post_json_with_login(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        client_login: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Обёртка над _post_json с опциональным per-request переопределением Client-Login.
+        Повторяет логику error-in-200 и единой обработки ошибок.
+        """
+        if not client_login:
+            return await self._post_json(url, payload)
+
+        assert self._client is not None
+        extra_headers = {"Client-Login": client_login}
+        resp = await self._client.post(url, json=payload, headers=extra_headers)
+        self._parse_units(resp)
+        if resp.status_code != 200:
+            raise DirectAPIError(resp.status_code, self._status_message(resp))
+        data = resp.json()
+        if "error" in data:
+            err = data["error"]
+            raise DirectAPIError(
+                int(err.get("error_code", 0)),
+                f"Ошибка API Директа: {err.get('error_detail') or err.get('error_string', '?')}",
+            )
+        return data
+
+    async def _post_negative_kw_sets(
+        self,
+        payload: dict[str, Any],
+        client_login: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        POST к сервису NegativeKeywordSharedSets (общие наборы минус-фраз).
+        Синхронный JSON, тот же формат ошибок, что у campaigns.
+        """
+        return await self._post_json_with_login(_NEGATIVE_KW_SETS_URL, payload, client_login)
+
+    async def _wordstat_request(
+        self,
+        method: str,
+        param: Any,
+        client_login: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Вызов legacy Wordstat API (Direct v4).
+
+        Эндпоинт: POST https://api.direct.yandex.ru/live/v4/json/
+        Тело: {"method": "...", "param": ..., "token": "...", "locale": "ru"}.
+        v4 принимает токен в теле (не в Authorization), но мы дублируем и в
+        заголовке — на случай, если Яндекс перейдёт на единый Bearer.
+
+        На успех: {"data": ...}. На ошибку: {"error_code": N, "error_str": "..."}.
+        """
+        assert self._client is not None, (
+            "Клиент не инициализирован. Используйте: async with DirectClient(...) as client"
+        )
+        body: dict[str, Any] = {
+            "method": method,
+            "param": param,
+            "token": self._token,
+            "locale": "ru",
+        }
+        headers: dict[str, str] = {}
+        if client_login:
+            headers["Client-Login"] = client_login
+
+        try:
+            resp = await self._client.post(
+                _WORDSTAT_URL,
+                json=body,
+                headers=headers or None,
+            )
+        except httpx.RequestError as exc:
+            raise DirectAPIError(0, f"Сетевая ошибка при запросе к Wordstat: {exc}") from exc
+
+        if resp.status_code != 200:
+            raise DirectAPIError(
+                resp.status_code,
+                f"Wordstat HTTP {resp.status_code}: {resp.text[:200]}",
+            )
+
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise DirectAPIError(0, f"Wordstat: некорректный JSON-ответ: {exc}") from exc
+
+        if isinstance(data, dict) and data.get("error_code"):
+            raise DirectAPIError(
+                int(data.get("error_code", 0)),
+                f"Wordstat: {data.get('error_str', 'неизвестная ошибка')}"
+                + (f" — {data.get('error_detail')}" if data.get("error_detail") else ""),
+            )
+        return data
+
+    # Коды Wordstat v4, означающие «отчёт ещё не готов» — не ошибка, повтори позже.
+    # 31/32 — исторические «Отчёт в процессе подготовки» / «Отчёт ещё не готов».
+    # Дополнительно страхуемся текстовым матчем: Яндекс иногда меняет коды.
+    _WORDSTAT_PENDING_CODES: frozenset[int] = frozenset({31, 32})
+    _WORDSTAT_PENDING_MARKERS: tuple[str, ...] = (
+        "процесс",    # «в процессе подготовки»
+        "не готов",   # «отчёт ещё не готов»
+        "pending",
+        "not ready",
+    )
+
+    @classmethod
+    def _is_wordstat_pending(cls, exc: DirectAPIError) -> bool:
+        """True если ошибка Wordstat означает «отчёт ещё строится»."""
+        if exc.status in cls._WORDSTAT_PENDING_CODES:
+            return True
+        msg = str(exc).lower()
+        return any(marker in msg for marker in cls._WORDSTAT_PENDING_MARKERS)
+
+    async def _wordstat_poll(
+        self,
+        report_id: int,
+        client_login: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Опрос GetWordstatReport до готовности.
+
+        Wordstat v4 сигнализирует «ещё не готово» ДВУМЯ способами:
+          1. data = [{"StatusReport": "Pending"}] (старая документация)
+          2. {"error_code": 31|32, "error_str": "Отчёт в процессе подготовки"}
+             — несмотря на поле error_code, это НЕ ошибка, а «приходи позже».
+        Оба варианта здесь трактуются как pending → sleep + continue.
+
+        Готово: data = [{"Phrase": ..., "Shows": ..., "SearchedWith": [...],
+                         "GeoID": [...], "MonthList": [...], "GeoList": [...]}]
+
+        Лимит _WORDSTAT_MAX_POLLS попыток с паузой _WORDSTAT_POLL_SLEEP секунд.
+        """
+        for _ in range(_WORDSTAT_MAX_POLLS):
+            try:
+                resp = await self._wordstat_request(
+                    "GetWordstatReport", report_id, client_login
+                )
+            except DirectAPIError as exc:
+                # Pending, замаскированный под «ошибку»: повторяем.
+                if self._is_wordstat_pending(exc):
+                    await asyncio.sleep(_WORDSTAT_POLL_SLEEP)
+                    continue
+                raise
+
+            inner = resp.get("data") if isinstance(resp, dict) else None
+
+            if isinstance(inner, list) and inner:
+                first = inner[0] if isinstance(inner[0], dict) else None
+                # Статус Pending в теле data — «отчёт ещё строится»
+                if first and first.get("StatusReport") == "Pending":
+                    await asyncio.sleep(_WORDSTAT_POLL_SLEEP)
+                    continue
+                return inner
+
+            await asyncio.sleep(_WORDSTAT_POLL_SLEEP)
+
+        raise DirectAPIError(
+            0,
+            f"Wordstat: отчёт {report_id} не готов после {_WORDSTAT_MAX_POLLS} попыток. "
+            "Попробуйте сократить число фраз или повторить позже.",
+        )
+
+    # Подтипы кампаний, поддерживающие NegativeKeywords на уровне кампании.
+    # Тип возвращается в Campaigns[].Type как UPPER_SNAKE, а сам объект подтипа
+    # лежит под PascalCase-ключом (TextCampaign, UnifiedCampaign и т.д.).
+    _NEGATIVE_KEYWORDS_SUBTYPES: dict[str, str] = {
+        "TEXT_CAMPAIGN": "TextCampaign",
+        "DYNAMIC_TEXT_CAMPAIGN": "DynamicTextCampaign",
+        "UNIFIED_CAMPAIGN": "UnifiedCampaign",
+        "SMART_CAMPAIGN": "SmartCampaign",
+        "MOBILE_APP_CAMPAIGN": "MobileAppCampaign",
+        "MCBANNER_CAMPAIGN": "MCBannerCampaign",
+    }
+
+    async def set_campaign_negative_keywords(
+        self,
+        campaign_id: int,
+        keywords: list[str],
+        mode: str = "append",
+        client_login: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Установить минус-фразы на уровне кампании Яндекс.Директа.
+
+        Алгоритм:
+          1. campaigns.get с *FieldNames: [NegativeKeywords] по всем поддерживаемым
+             подтипам — получаем Type и текущий список фраз.
+          2. mode='append': объединяем без дублей (case-insensitive).
+             mode='replace': заменяем весь список на переданный.
+          3. campaigns.update с корректным PascalCase-ключом подтипа.
+
+        Лимиты Директа: до 1000 минус-фраз на кампанию, до 20 000 символов суммарно,
+        каждая фраза — до 7 слов. Если нарушить — API вернёт 400 с деталями.
+
+        Возвращает сводку: type, previous_count, new_count, added_keywords.
+        """
+        if mode not in ("append", "replace"):
+            raise DirectAPIError(
+                0, f"Неверный mode: «{mode}». Используйте 'append' или 'replace'."
+            )
+
+        get_payload: dict[str, Any] = {
+            "method": "get",
+            "params": {
+                "SelectionCriteria": {"Ids": [campaign_id]},
+                "FieldNames": ["Id", "Name", "Type"],
+                "TextCampaignFieldNames": ["NegativeKeywords"],
+                "DynamicTextCampaignFieldNames": ["NegativeKeywords"],
+                "UnifiedCampaignFieldNames": ["NegativeKeywords"],
+                "SmartCampaignFieldNames": ["NegativeKeywords"],
+                "MobileAppCampaignFieldNames": ["NegativeKeywords"],
+                "MCBannerCampaignFieldNames": ["NegativeKeywords"],
+            },
+        }
+        get_data = await self._post_json_with_login(_CAMPAIGNS_URL, get_payload, client_login)
+        camps = get_data.get("result", {}).get("Campaigns", []) or []
+        if not camps:
+            raise DirectAPIError(0, f"Кампания {campaign_id} не найдена в аккаунте.")
+
+        camp = camps[0]
+        c_type = camp.get("Type", "")
+        subtype_key = self._NEGATIVE_KEYWORDS_SUBTYPES.get(c_type)
+        if not subtype_key:
+            raise DirectAPIError(
+                0,
+                f"Тип кампании «{c_type}» не поддерживает минус-фразы на уровне кампании. "
+                f"Поддерживаются: {', '.join(self._NEGATIVE_KEYWORDS_SUBTYPES)}.",
+            )
+
+        sub = camp.get(subtype_key) or {}
+        existing: list[str] = (sub.get("NegativeKeywords") or {}).get("Items") or []
+
+        if mode == "append":
+            existing_lower = {k.lower() for k in existing}
+            added = [k for k in keywords if k.lower() not in existing_lower]
+            new_list = existing + added
+        else:
+            added = list(keywords)
+            new_list = list(keywords)
+
+        update_payload: dict[str, Any] = {
+            "method": "update",
+            "params": {
+                "Campaigns": [
+                    {
+                        "Id": campaign_id,
+                        subtype_key: {
+                            "NegativeKeywords": {"Items": new_list}
+                        },
+                    }
+                ]
+            },
+        }
+        update_data = await self._post_json_with_login(
+            _CAMPAIGNS_URL, update_payload, client_login
+        )
+
+        return {
+            "campaign_id": campaign_id,
+            "campaign_name": camp.get("Name", ""),
+            "campaign_type": c_type,
+            "mode": mode,
+            "previous_count": len(existing),
+            "new_count": len(new_list),
+            "added_count": len(added),
+            "added_keywords": added,
+            "existing_keywords": existing,
+            "new_keywords": new_list,
+            "update_result": update_data.get("result", {}),
+        }
 
     async def get_ads(
         self,

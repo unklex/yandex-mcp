@@ -48,6 +48,8 @@ load_dotenv()
 BASE_JSON = "https://api.direct.yandex.com/json/v5"
 REPORTS_URL = f"{BASE_JSON}/reports"
 CAMPAIGNS_URL = f"{BASE_JSON}/campaigns"
+NEGATIVE_KW_SETS_URL = f"{BASE_JSON}/negativekeywordsharedsets"
+WORDSTAT_URL = "https://api.direct.yandex.ru/live/v4/json/"
 
 # Поля Reports API, которые возвращаются в микро-рублях.
 MICRO_FIELDS = {"Cost", "AvgCpc", "CostPerConversion", "Revenue"}
@@ -425,6 +427,140 @@ def get_budget(token: str, client_login: str | None = None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool 7: общие наборы минус-фраз (read-only)
+# ---------------------------------------------------------------------------
+
+def list_negative_keyword_sets(token: str, client_login: str | None = None) -> list[dict[str, Any]]:
+    """
+    Список общих наборов минус-фраз (NegativeKeywordSharedSets).
+
+    Read-only — безопасно гонять на проде. Создание/удаление наборов
+    не тестируем, чтобы не мусорить в аккаунте.
+    """
+    body = {
+        "method": "get",
+        "params": {
+            "FieldNames": ["Id", "Name", "NegativeKeywords", "SharedAccountId"],
+        },
+    }
+    resp = requests.post(
+        NEGATIVE_KW_SETS_URL,
+        json=body,
+        headers=_common_headers(token, client_login),
+        timeout=30,
+    )
+    _handle_json_status(resp, "negativekeywordsharedsets.get")
+    data = resp.json()
+    if "error" in data:
+        err = data["error"]
+        raise RuntimeError(
+            f"negativekeywordsharedsets.get: {err.get('error_detail') or err.get('error_string')}"
+        )
+    return data.get("result", {}).get("NegativeKeywordSharedSets", []) or []
+
+
+# ---------------------------------------------------------------------------
+# Tool 8: Wordstat — топ смежных запросов (legacy API v4)
+# ---------------------------------------------------------------------------
+
+def wordstat_top(
+    token: str,
+    phrases: list[str],
+    geo_ids: list[int] | None = None,
+    client_login: str | None = None,
+    max_polls: int = 10,
+    poll_sleep: float = 3.0,
+) -> list[dict[str, Any]]:
+    """
+    Wordstat v4: CreateNewWordstatReport → GetWordstatReport (polling).
+
+    Возвращает сырой data-массив с {Phrase, Shows, SearchedWith, GeoID, MonthList}.
+    На ошибку v4 отвечает не HTTP-кодом, а JSON-полем {"error_code", "error_str"}.
+    """
+    headers = {"Authorization": f"Bearer {token}", "Accept-Language": "ru"}
+    if client_login:
+        headers["Client-Login"] = client_login
+
+    # 1. Создаём отчёт
+    param: dict[str, Any] = {"Phrases": phrases}
+    if geo_ids:
+        param["GeoID"] = geo_ids
+    body = {"method": "CreateNewWordstatReport", "param": param, "token": token, "locale": "ru"}
+    resp = requests.post(WORDSTAT_URL, json=body, headers=headers, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Wordstat CreateNewWordstatReport: HTTP {resp.status_code} — {resp.text[:200]}")
+    create = resp.json()
+    if isinstance(create, dict) and create.get("error_code"):
+        raise RuntimeError(f"Wordstat: error_code={create['error_code']} — {create.get('error_str')}")
+    report_id = create.get("data") if isinstance(create, dict) else None
+    if not report_id:
+        raise RuntimeError(f"Wordstat: нет report_id в ответе — {create}")
+
+    # 2. Опрос до готовности
+    for _ in range(max_polls):
+        poll_body = {
+            "method": "GetWordstatReport",
+            "param": int(report_id),
+            "token": token,
+            "locale": "ru",
+        }
+        resp = requests.post(WORDSTAT_URL, json=poll_body, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Wordstat GetWordstatReport: HTTP {resp.status_code} — {resp.text[:200]}")
+        payload = resp.json()
+        if isinstance(payload, dict) and payload.get("error_code"):
+            raise RuntimeError(f"Wordstat: error_code={payload['error_code']} — {payload.get('error_str')}")
+        inner = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(inner, list) and inner:
+            first = inner[0] if isinstance(inner[0], dict) else None
+            if first and first.get("StatusReport") == "Pending":
+                time.sleep(poll_sleep)
+                continue
+            return inner
+        time.sleep(poll_sleep)
+
+    raise RuntimeError(f"Wordstat: отчёт {report_id} не готов после {max_polls} попыток")
+
+
+# ---------------------------------------------------------------------------
+# Tool 9: произвольный Reports API отчёт (get_custom_report)
+# ---------------------------------------------------------------------------
+
+def custom_report(
+    token: str,
+    report_type: str,
+    fields: list[str],
+    date_from: str,
+    date_to: str,
+    campaign_ids: list[int] | None = None,
+    limit: int = 100,
+    client_login: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Универсальный Reports-отчёт — аналог get_custom_report MCP-инструмента.
+    Просто гоняет заданный report_type через call_report() с фильтром по кампаниям.
+    """
+    selection: dict[str, Any] = {"DateFrom": date_from, "DateTo": date_to}
+    f = _campaign_filter(campaign_ids)
+    if f:
+        selection["Filter"] = f
+
+    body = {
+        "params": {
+            "SelectionCriteria": selection,
+            "FieldNames": fields,
+            "ReportName": f"custom_{report_type}_{uuid.uuid4().hex[:8]}",
+            "ReportType": report_type,
+            "DateRangeType": "CUSTOM_DATE",
+            "Format": "TSV",
+            "IncludeVAT": "NO",
+        }
+    }
+    rows = call_report(token, body, client_login)
+    return [_normalize_row(r) for r in rows][:limit]
+
+
+# ---------------------------------------------------------------------------
 # Вспомогательные
 # ---------------------------------------------------------------------------
 
@@ -555,6 +691,42 @@ def main() -> int:
             print(f"  API units:            spent={u['spent']}  available={u['available']}  daily_limit={u['daily_limit']}")
     except Exception as e:
         print(f"get_budget FAILED: {e}")
+
+    # 7. negative keyword shared sets (read-only)
+    try:
+        sets = list_negative_keyword_sets(token, client_login)
+        print(f"\n=== list_negative_keyword_sets: {len(sets)} наборов ===")
+        for s in sets[:5]:
+            kws = s.get("NegativeKeywords") or []
+            preview = ", ".join(kws[:5])
+            print(f"  {s.get('Id')}  «{s.get('Name')}»  phrases={len(kws)}  preview=[{preview}]")
+    except Exception as e:
+        print(f"list_negative_keyword_sets FAILED: {e}")
+
+    # 8. Wordstat — безопасный smoke-тест одной фразой
+    try:
+        w = wordstat_top(token, ["купить шины"], geo_ids=[213], client_login=client_login)
+        print(f"\n=== wordstat_top: {len(w)} фраз ===")
+        for item in w[:3]:
+            sw_count = len(item.get("SearchedWith") or [])
+            print(f"  «{item.get('Phrase')}»  shows={item.get('Shows')}  searched_with={sw_count}")
+    except Exception as e:
+        print(f"wordstat_top FAILED: {e}")
+
+    # 9. custom_report — простой прогон CAMPAIGN_PERFORMANCE_REPORT
+    try:
+        cr = custom_report(
+            token,
+            "CAMPAIGN_PERFORMANCE_REPORT",
+            ["CampaignId", "CampaignName", "Impressions", "Clicks", "Cost"],
+            date_from, date_to,
+            campaign_ids=None,
+            limit=5,
+            client_login=client_login,
+        )
+        _print_table("custom_report (CAMPAIGN_PERFORMANCE_REPORT)", cr, max_rows=5)
+    except Exception as e:
+        print(f"custom_report FAILED: {e}")
 
     return 0
 
