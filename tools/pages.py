@@ -1,9 +1,16 @@
 """
 Инструмент: get_top_pages
-Топ страниц по просмотрам с показателем отказов и временем на странице.
+Топ страниц входа по визитам с показателем отказов и временем на сайте.
 
-Важно: метрики страниц используют префикс ym:pv: (pageview),
-а НЕ ym:s: (session). Нельзя смешивать префиксы в одном запросе.
+Важно (исправлено 2026-08-09): метрик `ym:pv:bounceRate` и
+`ym:pv:avgVisitDurationSeconds` В API НЕ СУЩЕСТВУЕТ. Отказ и длительность —
+характеристики ВИЗИТА (`ym:s:`), а не отдельного просмотра (`ym:pv:`).
+Прежняя версия просила их с префиксом `ym:pv:` и получала ошибку 4002
+(«нельзя смешивать ym:s: и ym:pv: в одном запросе») на каждом вызове.
+
+Поэтому отчёт построен целиком на `ym:s:` и сгруппирован по СТРАНИЦЕ ВХОДА
+(`ym:s:startURLPathFull`). Для SEO это и нужно: видно, на какие статьи люди
+приземляются из поиска, с каким отказом и сколько времени проводят.
 """
 
 from __future__ import annotations
@@ -11,7 +18,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from app import mcp, resolve_counter
 from metrica_client import MetricaAPIError
@@ -26,14 +33,17 @@ async def get_top_pages(
     counter_id: Optional[str] = None,
 ) -> str:
     """
-    Получить топ страниц сайта по количеству просмотров с показателем отказов
-    и средним временем на странице.
+    Получить топ страниц входа по количеству визитов с показателем отказов
+    и средним временем на сайте.
 
     Параметры:
     - date_from:  дата начала. Форматы: YYYY-MM-DD, today, yesterday, NdaysAgo
     - date_to:    дата окончания. Те же форматы.
     - limit:      количество страниц в отчёте (по умолчанию 20, максимум 100)
     - counter_id: ID счётчика (необязательно)
+
+    Группировка — по странице входа (landing page). Это отчёт «куда люди
+    приземляются», а не «какие страницы просматривают внутри визита».
 
     Возвращает сырые данные в JSON. При ответе пользователю ВСЕГДА форматируй
     данные в виде читаемой таблицы Markdown на русском языке с нумерацией.
@@ -44,16 +54,16 @@ async def get_top_pages(
 
     try:
         data = await client.get_data(
-            # Используем ym:pv: — метрики просмотров страниц
+            # Только ym:s: — смешивать префиксы с ym:pv: нельзя (ошибка 4002)
             metrics=(
-                "ym:pv:pageviews,"
-                "ym:pv:bounceRate,"
-                "ym:pv:avgVisitDurationSeconds"
+                "ym:s:visits,"
+                "ym:s:bounceRate,"
+                "ym:s:avgVisitDurationSeconds"
             ),
-            dimensions="ym:pv:URLPathFull",
+            dimensions="ym:s:startURLPathFull",
             date1=date_from,
             date2=date_to,
-            sort="-ym:pv:pageviews",
+            sort="-ym:s:visits",
             limit=limit,
             counter_id=resolved_id,
         )
@@ -74,10 +84,10 @@ async def get_top_pages(
         dim = row.get("dimensions", [{}])[0]
         url = dim.get("name", "—")
         m = (list(row.get("metrics", [])) + [0, 0, 0])[:3]
-        pageviews, bounce_rate, avg_duration = m
+        visits, bounce_rate, avg_duration = m
         pages.append({
             "url": url,
-            "pageviews": int(pageviews),
+            "visits": int(visits),
             "bounce_rate_pct": round(float(bounce_rate), 2),
             "avg_duration_sec": round(float(avg_duration), 1),
         })
@@ -85,6 +95,7 @@ async def get_top_pages(
     result: dict = {
         "period": {"from": date_from, "to": date_to},
         "counter_id": resolved_id,
+        "grouping": "страница входа (ym:s:startURLPathFull)",
         "returned_rows": len(pages),
         "total_rows": data.get("total_rows", len(pages)),
         "pages": pages,

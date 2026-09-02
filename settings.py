@@ -13,6 +13,10 @@
     YANDEX_DIRECT_ACCOUNTS       — несколько аккаунтов Директа: alias1:token1,alias2:token2
     YANDEX_DIRECT_TOKEN          — один аккаунт Директа (упрощённый вариант)
     YANDEX_DIRECT_CLIENT_LOGIN   — логин клиента для агентских аккаунтов
+    YANDEX_SEARCH_API_KEY        — API-ключ сервисного аккаунта Yandex Cloud
+                                   Search API v2 (для инструментов Wordstat)
+    YANDEX_FOLDER_ID             — ID каталога (folder) Yandex Cloud того же
+                                   сервисного аккаунта (для инструментов Wordstat)
 """
 
 from __future__ import annotations
@@ -43,6 +47,16 @@ class Settings:
 
     direct_client_login: str | None
     """Логин клиента для агентских аккаунтов (Client-Login заголовок)."""
+
+    # ── Yandex Cloud Search API v2 (Wordstat) ───────────────────────────────
+    search_api_key: str | None
+    """API-ключ сервисного аккаунта Yandex Cloud (заголовок Authorization: Api-Key).
+    None, если YANDEX_SEARCH_API_KEY не задан — тогда инструменты Wordstat
+    вернут понятную ошибку, но остальной сервер работает как обычно."""
+
+    search_folder_id: str | None
+    """ID каталога (folder) Yandex Cloud для тела запросов Search API v2.
+    None, если YANDEX_FOLDER_ID не задан."""
 
 
 def _require(name: str) -> str:
@@ -101,10 +115,18 @@ def load() -> Settings:
 
     direct_client_login = os.getenv("YANDEX_DIRECT_CLIENT_LOGIN", "").strip() or None
 
+    # Yandex Cloud Search API v2 (Wordstat). Оба необязательны на уровне запуска —
+    # проверка наличия делается в самих инструментах Wordstat, чтобы сервер
+    # поднимался даже без конфигурации Search API.
+    search_api_key = os.getenv("YANDEX_SEARCH_API_KEY", "").strip() or None
+    search_folder_id = os.getenv("YANDEX_FOLDER_ID", "").strip() or None
+
     return Settings(
         metrica_token=metrica_token,
         metrica_counter_id=metrica_counter_id,
         metrica_counters=metrica_counters,
         direct_accounts=direct_accounts,
         direct_client_login=direct_client_login,
+        search_api_key=search_api_key,
+        search_folder_id=search_folder_id,
     )

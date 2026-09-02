@@ -21,7 +21,7 @@ import json
 import re
 from typing import Optional
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from app import mcp, resolve_direct_client
 from direct_client import DirectAPIError

@@ -1,11 +1,19 @@
 # Секреты и локальная конфигурация
 .env
+.env.bak*
+
+# Личные конфиги Claude Desktop (пути и данные конкретной машины)
+claude_desktop_config.FULL.json
+claude_desktop_config.snippet.json
 
 # Утилиты с захардкоженными токенами — только для локальной настройки
 setup_mcp.py
 update_token.py
 update_direct.py
 update_counter.py
+
+# Локальный кэш (дерево регионов Wordstat и т.п.)
+.cache/
 
 # Python
 .venv/

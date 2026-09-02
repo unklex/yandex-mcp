@@ -4,6 +4,55 @@
 
 ---
 
+## [1.3.1] — 2026-09-02
+
+### Исправлено
+
+- **Крах при старте** — `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`.
+  Причина: пересобранное `.venv` подтянуло MCP Python SDK v2 (`mcp==2.1.1`), а код
+  был написан под v1; `requirements.txt` временно фиксировал `mcp>=1.0.0,<2` как
+  затычку.
+
+### Изменено
+
+- **Миграция MCP Python SDK v1 → v2** (`mcp>=2,<3`).
+  - `app.py` — `from mcp.server.fastmcp import FastMCP` →
+    `from mcp.server.mcpserver import MCPServer`; конструктор и аннотация
+    `lifespan(server: MCPServer)` обновлены. Имя сервера
+    (`"Яндекс.Метрика + Директ"`) не изменилось.
+  - Все 14 модулей `tools/*.py` — `from mcp.server.fastmcp import Context` →
+    `from mcp.server.mcpserver import Context`.
+  - `requirements.txt` — `mcp>=1.0.0,<2` → `mcp>=2,<3`. Конфликтов с `httpx` не
+    обнаружено: v2 зависит от отдельного пакета `httpx2`, наши клиенты
+    по-прежнему используют `httpx` напрямую.
+  - `ctx.request_context.lifespan_context` — доступ к lifespan-словарю
+    (`client`, `direct_client`, `direct_clients`, `wordstat_client`,
+    `default_counter_id`, `counters_map`) **не изменился** в v2, все 30
+    call-сайтов в `tools/*.py` оставлены как есть.
+  - Семантика lifespan для stdio-транспорта не изменилась: контекст
+    открывается один раз на процесс/соединение (как и в v1), `AsyncExitStack`
+    закрывает `MetricaClient` / `DirectClient`ы / `WordstatClient` при
+    завершении соединения.
+  - Бизнес-логика (`resolve_counter`, `resolve_direct_client`), имена и
+    параметры инструментов, формат возвращаемых данных — не изменены.
+
+### Побочный эффект v2 (не требует действий)
+
+- Все 30 инструментов аннотированы `-> str`, поэтому v2 теперь автоматически
+  генерирует для каждого `outputSchema` и добавляет `structuredContent`
+  (`{"result": "<та же JSON-строка>"}`) в ответ `tools/call` — вдобавок к
+  прежнему `content[0].text`, без изменений для существующих потребителей.
+
+### Проверено
+
+- Старт `python server.py` над stdio — без трейсбека.
+- Полный MCP handshake (`initialize` → `notifications/initialized` →
+  `tools/list`) — все 30 инструментов на месте, у каждого непустая схема.
+- Сквозной вызов `get_realtime` — реальный `200 OK` от Metrika API,
+  `lifespan_context` и `resolve_counter` работают через новый accessor.
+
+---
+
 ## [1.3.0] — 2026-04-19
 
 ### Добавлено

@@ -1,42 +1,88 @@
 """
 Инструменты Яндекс.Wordstat — исследование ключевых фраз.
 
-Использует legacy Direct API v4 (https://api.direct.yandex.ru/live/v4/json/)
-с асинхронной polling-моделью:
-  1. CreateNewWordstatReport → возвращает report_id
-  2. GetWordstatReport       → опрашиваем до статуса не-pending
+Реализованы на Yandex Cloud Search API v2 (часть Yandex Cloud AI Studio),
+пришедшем на смену legacy Direct API v4 (CreateNewWordstatReport + polling).
+
+Отличия от старой реализации:
+  - Синхронный REST: один POST → ответ сразу, без report_id и опроса.
+  - Аутентификация одним API-ключом сервисного аккаунта (Authorization: Api-Key),
+    без Директа, OAuth и Client-Login.
+  - `wordstat_dynamics` снова работает: v2 штатно отдаёт динамику по периодам
+    (день/неделя/месяц), в отличие от v4, переставшего возвращать MonthList.
 
 Инструменты:
-  - wordstat_top_requests  — топ смежных запросов (SearchedWith) по фразам
-  - wordstat_dynamics      — помесячная динамика показов (MonthList)
-  - wordstat_regions       — распределение показов по регионам (GeoList)
+  - wordstat_top_requests  — топ запросов и ассоциаций по фразам
+  - wordstat_dynamics      — динамика показов по периодам (день/неделя/месяц)
+  - wordstat_regions       — распределение показов по регионам (окно 30 дней)
 
-Лимиты Wordstat: ~1000 отчётов в сутки на токен; один отчёт принимает до
-10 фраз и готовится 3–30 секунд.
+Конфигурация: YANDEX_SEARCH_API_KEY + YANDEX_FOLDER_ID (см. settings.py).
+Лимит Search API: ~5–10 RPS (ретраи на 429 — в WordstatClient).
 """
 
 from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
-from app import mcp, resolve_direct_client
-from direct_client import DirectAPIError
+from app import mcp
+from wordstat_client import WordstatClient, WordstatAPIError
+
+# Допустимые значения enum-ов Search API v2.
+_DEVICES = {"DEVICE_ALL", "DEVICE_DESKTOP", "DEVICE_PHONE", "DEVICE_TABLET"}
+_PERIODS = {"PERIOD_MONTHLY", "PERIOD_WEEKLY", "PERIOD_DAILY"}
+_REGION_MODES = {"REGION_ALL", "REGION_CITIES", "REGION_REGIONS"}
+
+_MAX_NUM_PHRASES = 2000
+# topRequests в v2 принимает ОДНУ фразу. Чтобы не ломать существующих
+# вызывающих (инструмент исторически принимал до 10 фраз через запятую),
+# сохраняем multi-phrase эргономику: перебираем фразы на клиенте с учётом
+# лимита RPS и агрегируем. Ограничение в 10 фраз оставляем прежним.
+_MAX_PHRASES = 10
 
 
-def _no_direct_error(account: str | None = None) -> str:
-    msg = "Клиент Яндекс.Директа не инициализирован."
-    if account:
-        msg += f" Аккаунт «{account}» не найден в YANDEX_DIRECT_ACCOUNTS."
-    msg += " Проверьте переменные окружения YANDEX_DIRECT_ACCOUNTS или YANDEX_DIRECT_TOKEN."
-    return json.dumps({"error": msg}, ensure_ascii=False)
+# ---------------------------------------------------------------------------
+# Общие помощники
+# ---------------------------------------------------------------------------
+
+def _no_client_error() -> str:
+    return json.dumps(
+        {
+            "error": "Клиент Wordstat (Yandex Cloud Search API v2) не инициализирован. "
+            "Задайте переменные окружения YANDEX_SEARCH_API_KEY и YANDEX_FOLDER_ID "
+            "(сервисный аккаунт с ролью search-api.webSearch.user и ключом со scope "
+            "yc.search-api.execute)."
+        },
+        ensure_ascii=False,
+    )
+
+
+def _get_client(ctx: Context) -> WordstatClient | None:
+    return ctx.request_context.lifespan_context.get("wordstat_client")
+
+
+def _to_int(value: Any) -> int:
+    """Приводит строковый count/totalCount к int (v2 отдаёт их строками)."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _to_float(value: Any) -> float:
+    """Приводит share/affinityIndex к float (иногда приходят строками)."""
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _parse_csv(raw: str | None) -> list[str]:
-    """Разбор строковых CSV (запятая/точка с запятой), с удалением дублей."""
+    """Разбор CSV (запятая/точка с запятой) с удалением дублей и пустых."""
     if not raw:
         return []
     parts = re.split(r"[,;]\s*", raw)
@@ -54,47 +100,28 @@ def _parse_csv(raw: str | None) -> list[str]:
     return out
 
 
-def _parse_int_list(raw: str | None, param: str) -> tuple[list[int] | None, str | None]:
+def _parse_regions(raw: str | None) -> list[str]:
+    """geo_ids → список строковых ID регионов (v2 ждёт строки, напр. '213')."""
+    return _parse_csv(raw)
+
+
+def _parse_devices(raw: str | None) -> tuple[list[str] | None, str | None]:
+    """devices → валидированный список enum-ов или ошибка."""
     if not raw:
         return None, None
-    try:
-        ids = [int(x.strip()) for x in re.split(r"[,;]\s*", raw) if x.strip()]
-        return (ids or None), None
-    except ValueError:
-        return None, f"Параметр {param} должен содержать целые числа через запятую (например, '213,2').";
-
-
-async def _create_and_poll(
-    direct,
-    phrases: list[str],
-    geo_ids: list[int] | None,
-    client_login: str | None,
-) -> list[dict[str, Any]]:
-    """
-    Создаёт Wordstat-отчёт и ожидает готовности. Возвращает data-массив.
-    Обрабатывает обе формы ответа v4: {"data": report_id} на create.
-    """
-    param: dict[str, Any] = {"Phrases": phrases}
-    if geo_ids:
-        param["GeoID"] = geo_ids
-
-    create_resp = await direct._wordstat_request(
-        "CreateNewWordstatReport", param, client_login
-    )
-    report_id = create_resp.get("data") if isinstance(create_resp, dict) else None
-    if not isinstance(report_id, (int, str)) or not str(report_id).strip():
-        raise DirectAPIError(
-            0,
-            f"Wordstat: не удалось создать отчёт, некорректный ответ: {create_resp}",
+    items = [d.strip().upper() for d in re.split(r"[,;]\s*", raw) if d.strip()]
+    bad = [d for d in items if d not in _DEVICES]
+    if bad:
+        return None, (
+            f"Недопустимые значения devices: {', '.join(bad)}. "
+            f"Допустимо: {', '.join(sorted(_DEVICES))}."
         )
+    return (items or None), None
 
-    try:
-        report_id_int = int(report_id)
-    except (TypeError, ValueError) as exc:
-        raise DirectAPIError(0, f"Wordstat: некорректный report_id: {report_id}") from exc
 
-    return await direct._wordstat_poll(report_id_int, client_login=client_login)
-
+# ---------------------------------------------------------------------------
+# 1. wordstat_top_requests → POST /v2/wordstat/topRequests
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
 async def wordstat_top_requests(
@@ -102,227 +129,393 @@ async def wordstat_top_requests(
     phrases: str,
     geo_ids: Optional[str] = None,
     limit: int = 50,
-    account: Optional[str] = None,
-    client_login: Optional[str] = None,
+    devices: Optional[str] = None,
 ) -> str:
     """
-    Получить топ смежных поисковых запросов по заданным фразам через Wordstat.
+    Топ похожих поисковых запросов и ассоциаций по фразам (Wordstat, Search API v2).
 
-    Для каждой переданной фразы возвращает список «что ещё искали» (SearchedWith)
-    с месячными показами. Полезно для расширения семантики и поиска минус-слов.
+    Для каждой фразы возвращает:
+      - results:      сами вхождения фразы и её уточнения с числом показов;
+      - associations: «с этим также искали» (похожие запросы) с показами.
+    Полезно для расширения семантики и поиска минус-слов.
 
     Параметры:
-    - phrases:      фразы через запятую (до 10 штук). Пример:
-                    'купить диван, диван москва'
-    - geo_ids:      ID регионов Яндекса через запятую (пример: '213' — Москва,
-                    '225' — Россия). По умолчанию — все регионы.
-    - limit:        макс. кол-во смежных запросов на каждую фразу (по умолчанию 50)
-    - account:      псевдоним аккаунта Директа (необязательно)
-    - client_login: логин клиента для агентских аккаунтов (необязательно)
+    - phrases:  одна или несколько фраз через запятую (до 10). Поддерживаются
+                операторы Wordstat (кавычки, !, +, - и т.д.). Для каждой фразы
+                делается отдельный синхронный запрос к API.
+    - geo_ids:  ID регионов Яндекса через запятую ('213' — Москва, '225' —
+                Россия). Пусто = все регионы.
+    - limit:    макс. число строк results/associations на фразу (numPhrases),
+                по умолчанию 50, максимум 2000.
+    - devices:  типы устройств через запятую: DEVICE_ALL, DEVICE_DESKTOP,
+                DEVICE_PHONE, DEVICE_TABLET. Пусто = все устройства.
 
-    Лимиты Wordstat: ~1000 отчётов/сутки на токен; отчёт строится 3–30 секунд.
-    Возвращает JSON со списком {phrase, shows, top_associated: [{phrase, shows}]}.
+    Возвращает JSON: {phrases, geo_ids, returned_phrases, results:[{phrase,
+    total_count, results:[{phrase,count}], associations:[{phrase,count}]}]}.
+    Все count/totalCount приведены к int.
     """
-    lc = ctx.request_context.lifespan_context
-    direct = resolve_direct_client(account, lc)
-    if direct is None:
-        return _no_direct_error(account)
+    ws = _get_client(ctx)
+    if ws is None:
+        return _no_client_error()
 
     parsed_phrases = _parse_csv(phrases)
     if not parsed_phrases:
         return json.dumps({"error": "Параметр phrases пуст."}, ensure_ascii=False)
-    if len(parsed_phrases) > 10:
+    if len(parsed_phrases) > _MAX_PHRASES:
         return json.dumps(
-            {"error": f"Wordstat принимает не более 10 фраз за запрос. Получено: {len(parsed_phrases)}."},
+            {"error": f"Не более {_MAX_PHRASES} фраз за вызов. Получено: {len(parsed_phrases)}."},
             ensure_ascii=False,
         )
 
-    parsed_geo, err = _parse_int_list(geo_ids, "geo_ids")
+    num_phrases = max(1, min(int(limit or 50), _MAX_NUM_PHRASES))
+    regions = _parse_regions(geo_ids)
+    device_list, err = _parse_devices(devices)
     if err:
         return json.dumps({"error": err}, ensure_ascii=False)
 
-    try:
-        data = await _create_and_poll(direct, parsed_phrases, parsed_geo, client_login)
-    except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-
     entries: list[dict] = []
-    for item in data:
-        searched_with = item.get("SearchedWith") or []
-        assoc = [
-            {
-                "phrase": sw.get("Phrase", ""),
-                "shows": int(sw.get("Shows") or 0),
-            }
-            for sw in searched_with
-            if isinstance(sw, dict)
-        ]
-        assoc.sort(key=lambda x: x["shows"], reverse=True)
-        entries.append({
-            "phrase": item.get("Phrase", ""),
-            "shows": int(item.get("Shows") or 0),
-            "associated_count": len(assoc),
-            "top_associated": assoc[:limit],
-        })
-    entries.sort(key=lambda x: x["shows"], reverse=True)
+    for phrase in parsed_phrases:
+        try:
+            data = await ws.top_requests(
+                phrase,
+                num_phrases=num_phrases,
+                regions=regions or None,
+                devices=device_list,
+            )
+        except WordstatAPIError as e:
+            return json.dumps({"error": str(e), "phrase": phrase}, ensure_ascii=False)
 
+        results = [
+            {"phrase": r.get("phrase", ""), "count": _to_int(r.get("count"))}
+            for r in (data.get("results") or [])
+            if isinstance(r, dict)
+        ]
+        associations = [
+            {"phrase": a.get("phrase", ""), "count": _to_int(a.get("count"))}
+            for a in (data.get("associations") or [])
+            if isinstance(a, dict)
+        ]
+        entries.append({
+            "phrase": phrase,
+            "total_count": _to_int(data.get("totalCount")),
+            "results_count": len(results),
+            "associations_count": len(associations),
+            "results": results,
+            "associations": associations,
+        })
+
+    entries.sort(key=lambda x: x["total_count"], reverse=True)
     result: dict = {
-        "account": account or "primary",
         "phrases": parsed_phrases,
-        "geo_ids": parsed_geo if parsed_geo else "all_russia",
+        "geo_ids": regions if regions else "all_regions",
+        "devices": device_list or "all_devices",
         "returned_phrases": len(entries),
         "results": entries,
     }
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# 2. wordstat_dynamics → POST /v2/wordstat/dynamics
+# ---------------------------------------------------------------------------
+
+def _parse_rfc3339(raw: str) -> datetime:
+    """Разбирает дату в RFC3339/ISO. Возвращает aware-datetime (UTC)."""
+    s = raw.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError as exc:
+        # Допускаем чистый YYYY-MM-DD
+        try:
+            dt = datetime.strptime(raw.strip(), "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(
+                f"Неверный формат даты «{raw}». Используйте RFC3339, например "
+                "2025-12-29T00:00:00Z или 2025-12-29."
+            ) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _to_rfc3339(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _is_last_day_of_month(dt: datetime) -> bool:
+    return (dt + timedelta(days=1)).month != dt.month
+
+
+def _align_error(period: str, which: str, dt: datetime) -> str | None:
+    """Проверяет выравнивание даты под период. Возвращает текст ошибки или None.
+
+    Требования Search API v2 (проверено на живом API):
+      WEEKLY:  from_date — понедельник, to_date — воскресенье.
+      MONTHLY: from_date — 1-е число месяца, to_date — последний день месяца.
+      DAILY:   без ограничений.
+    """
+    if period == "PERIOD_WEEKLY":
+        if which == "from_date" and dt.weekday() != 0:
+            return (
+                f"Для PERIOD_WEEKLY from_date должна быть понедельником "
+                f"(получено {dt.date()}, это {dt.strftime('%A')})."
+            )
+        if which == "to_date" and dt.weekday() != 6:
+            return (
+                f"Для PERIOD_WEEKLY to_date должна быть воскресеньем "
+                f"(получено {dt.date()}, это {dt.strftime('%A')})."
+            )
+    if period == "PERIOD_MONTHLY":
+        if which == "from_date" and dt.day != 1:
+            return f"Для PERIOD_MONTHLY from_date должна быть 1-м числом месяца (получено {dt.date()})."
+        if which == "to_date" and not _is_last_day_of_month(dt):
+            return f"Для PERIOD_MONTHLY to_date должна быть последним днём месяца (получено {dt.date()})."
+    return None
+
+
+def _default_window(period: str, now: datetime) -> tuple[datetime, datetime]:
+    """Окно по умолчанию, выровненное под период (последние завершённые интервалы).
+
+    Monthly: последние 12 завершённых месяцев (1-е число … последний день).
+    Weekly:  последние 12 завершённых недель (понедельник … воскресенье).
+    Daily:   последние 30 дней (по вчерашний день включительно).
+    """
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "PERIOD_MONTHLY":
+        first_this_month = today.replace(day=1)
+        to_dt = first_this_month - timedelta(days=1)          # последний день прошлого месяца
+        year, month = to_dt.year, to_dt.month - 11            # 12 месяцев включительно
+        while month <= 0:
+            month += 12
+            year -= 1
+        from_dt = to_dt.replace(year=year, month=month, day=1)
+        return from_dt, to_dt
+    if period == "PERIOD_WEEKLY":
+        this_monday = today - timedelta(days=today.weekday())
+        to_dt = this_monday - timedelta(days=1)               # последнее воскресенье
+        from_dt = this_monday - timedelta(weeks=12)           # понедельник 12 недель назад
+        return from_dt, to_dt
+    # PERIOD_DAILY
+    to_dt = today - timedelta(days=1)                         # вчера
+    return to_dt - timedelta(days=29), to_dt                  # 30 дней включительно
+
+
 @mcp.tool()
 async def wordstat_dynamics(
     ctx: Context,
     phrase: str,
+    period: str = "PERIOD_MONTHLY",
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
     geo_ids: Optional[str] = None,
-    account: Optional[str] = None,
-    client_login: Optional[str] = None,
+    devices: Optional[str] = None,
 ) -> str:
     """
-    Получить помесячную динамику показов для одной фразы через Wordstat.
+    Динамика показов фразы по периодам (Wordstat, Search API v2).
 
-    Возвращает данные за последние ~24 месяца. Позволяет оценить сезонность
-    и тренды спроса (например, «купить шины» — сезонный пик в октябре).
+    В отличие от legacy Direct API v4 (который перестал отдавать MonthList),
+    v2 штатно возвращает динамику по дням/неделям/месяцам. Для каждого периода
+    отдаётся число показов и share — доля этой фразы среди ВСЕХ запросов Яндекса
+    за период (удобно для нормализации трендов и сезонности).
 
     Параметры:
-    - phrase:       одна фраза для анализа. Пример: 'вывоз мусора москва'.
-    - geo_ids:      ID регионов Яндекса через запятую (по умолчанию — все)
-    - account:      псевдоним аккаунта Директа (необязательно)
-    - client_login: логин клиента для агентских аккаунтов (необязательно)
+    - phrase:    одна фраза. По операторам: для дневной разбивки (PERIOD_DAILY)
+                 поддерживаются все операторы Wordstat; для недельной/месячной —
+                 только оператор `+`.
+    - period:    PERIOD_MONTHLY (по умолч.) | PERIOD_WEEKLY | PERIOD_DAILY.
+    - from_date: начало периода, RFC3339 (напр. 2025-01-01T00:00:00Z или
+                 2025-01-01). Выравнивание обязательно, иначе вернётся ошибка:
+                 WEEKLY — понедельник, MONTHLY — 1-е число месяца.
+    - to_date:   конец периода, RFC3339. Выравнивание: WEEKLY — воскресенье,
+                 MONTHLY — последний день месяца, DAILY — без ограничений.
+                 Если from_date/to_date не заданы — берётся окно по умолчанию
+                 (последние 12 завершённых месяцев для MONTHLY, 12 недель для
+                 WEEKLY, 30 дней для DAILY).
+    - geo_ids:   ID регионов через запятую ('213' — Москва). Пусто = все.
+    - devices:   DEVICE_ALL | DEVICE_DESKTOP | DEVICE_PHONE | DEVICE_TABLET
+                 через запятую. Пусто = все.
 
-    Возвращает JSON: {phrase, total_shows, months_count, monthly_data: [
-    {year, month, shows}], summary: {min_shows, max_shows, avg_shows}}.
-    При ответе форматируй динамику как таблицу по месяцам (хронологически).
+    Возвращает JSON: {phrase, period, from_date, to_date, points_count,
+    dynamics:[{date, count(int), share(float)}], summary:{min_count, max_count,
+    avg_count}}. При ответе удобно оформить таблицей по периодам.
     """
-    lc = ctx.request_context.lifespan_context
-    direct = resolve_direct_client(account, lc)
-    if direct is None:
-        return _no_direct_error(account)
+    ws = _get_client(ctx)
+    if ws is None:
+        return _no_client_error()
 
     phrase_str = (phrase or "").strip()
     if not phrase_str:
         return json.dumps({"error": "Параметр phrase пуст."}, ensure_ascii=False)
 
-    parsed_geo, err = _parse_int_list(geo_ids, "geo_ids")
+    period = (period or "PERIOD_MONTHLY").strip().upper()
+    if period not in _PERIODS:
+        return json.dumps(
+            {"error": f"Недопустимый period: «{period}». Допустимо: {', '.join(sorted(_PERIODS))}."},
+            ensure_ascii=False,
+        )
+
+    now = datetime.now(timezone.utc)
+    try:
+        if from_date and to_date:
+            from_dt = _parse_rfc3339(from_date)
+            to_dt = _parse_rfc3339(to_date)
+        elif from_date or to_date:
+            return json.dumps(
+                {"error": "Задайте и from_date, и to_date одновременно, либо оставьте оба пустыми."},
+                ensure_ascii=False,
+            )
+        else:
+            from_dt, to_dt = _default_window(period, now)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    if from_dt >= to_dt:
+        return json.dumps({"error": "from_date должна быть раньше to_date."}, ensure_ascii=False)
+
+    for which, dt in (("from_date", from_dt), ("to_date", to_dt)):
+        align_err = _align_error(period, which, dt)
+        if align_err:
+            return json.dumps({"error": align_err}, ensure_ascii=False)
+
+    regions = _parse_regions(geo_ids)
+    device_list, err = _parse_devices(devices)
     if err:
         return json.dumps({"error": err}, ensure_ascii=False)
 
     try:
-        data = await _create_and_poll(direct, [phrase_str], parsed_geo, client_login)
-    except DirectAPIError as e:
+        data = await ws.dynamics(
+            phrase_str,
+            period=period,
+            from_date=_to_rfc3339(from_dt),
+            to_date=_to_rfc3339(to_dt),
+            regions=regions or None,
+            devices=device_list,
+        )
+    except WordstatAPIError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-    if not data:
-        return json.dumps(
-            {"error": f"Wordstat не вернул данных для фразы «{phrase_str}»."},
-            ensure_ascii=False,
-        )
+    points = [
+        {
+            "date": r.get("date", ""),
+            "count": _to_int(r.get("count")),
+            "share": _to_float(r.get("share")),
+        }
+        for r in (data.get("results") or [])
+        if isinstance(r, dict)
+    ]
 
-    first = data[0] if isinstance(data[0], dict) else {}
-    monthly: list[dict] = []
-    for m in first.get("MonthList") or []:
-        if not isinstance(m, dict):
-            continue
-        monthly.append({
-            "year": int(m.get("Year") or 0),
-            "month": int(m.get("Month") or 0),
-            "shows": int(m.get("Shows") or 0),
-        })
-    monthly.sort(key=lambda x: (x["year"], x["month"]))
-
-    shows_list = [m["shows"] for m in monthly]
+    counts = [p["count"] for p in points]
     summary = {
-        "min_shows": min(shows_list) if shows_list else 0,
-        "max_shows": max(shows_list) if shows_list else 0,
-        "avg_shows": round(sum(shows_list) / len(shows_list), 1) if shows_list else 0.0,
+        "min_count": min(counts) if counts else 0,
+        "max_count": max(counts) if counts else 0,
+        "avg_count": round(sum(counts) / len(counts), 1) if counts else 0.0,
     }
 
     result: dict = {
-        "account": account or "primary",
-        "phrase": first.get("Phrase", phrase_str),
-        "geo_ids": parsed_geo if parsed_geo else "all_russia",
-        "total_shows": int(first.get("Shows") or 0),
-        "months_count": len(monthly),
-        "monthly_data": monthly,
+        "phrase": phrase_str,
+        "period": period,
+        "from_date": _to_rfc3339(from_dt),
+        "to_date": _to_rfc3339(to_dt),
+        "geo_ids": regions if regions else "all_regions",
+        "devices": device_list or "all_devices",
+        "points_count": len(points),
+        "dynamics": points,
         "summary": summary,
     }
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# 3. wordstat_regions → POST /v2/wordstat/regions
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 async def wordstat_regions(
     ctx: Context,
     phrase: str,
-    limit: int = 30,
-    account: Optional[str] = None,
-    client_login: Optional[str] = None,
+    region: str = "REGION_ALL",
+    limit: int = 50,
+    devices: Optional[str] = None,
 ) -> str:
     """
-    Получить распределение показов по регионам для одной фразы через Wordstat.
+    Распределение показов фразы по регионам за последние 30 дней (Search API v2).
 
-    Показывает топ регионов, из которых пользователи ищут данную фразу,
-    с долей от общего числа показов (ShowsPercent). Полезно для географической
-    оптимизации таргетинга.
+    Окно фиксировано (30 дней, не настраивается). Для каждого региона отдаётся:
+      - count:         число показов;
+      - share:         доля показов региона;
+      - affinity_index: индекс интереса (%) — отношение доли фразы в регионе к
+                        её доле по стране. >100 = регион ищет фразу активнее среднего.
+    ID регионов дополняются человекочитаемыми названиями (region_name) через
+    кэшируемое дерево регионов (getRegionsTree, кэш на диске, TTL 30 дней).
 
     Параметры:
-    - phrase:       одна фраза для анализа
-    - limit:        топ-N регионов в результате (по умолчанию 30)
-    - account:      псевдоним аккаунта Директа (необязательно)
-    - client_login: логин клиента для агентских аккаунтов (необязательно)
+    - phrase:  одна фраза (поддерживаются операторы Wordstat).
+    - region:  срез регионов — одиночный enum, НЕ список ID:
+               REGION_ALL (все, по умолч.) | REGION_CITIES (только города) |
+               REGION_REGIONS (только субъекты федерации).
+    - limit:   топ-N регионов в ответе (по убыванию показов), по умолчанию 50.
+    - devices: DEVICE_ALL | DEVICE_DESKTOP | DEVICE_PHONE | DEVICE_TABLET
+               через запятую. Пусто = все.
 
-    ВНИМАНИЕ: запрос делается БЕЗ geo-фильтра — Wordstat возвращает GeoList
-    только в таком режиме. Для распределения в конкретном регионе сузьте
-    фразу вручную (например, 'диван москва' вместо 'диван').
-
-    Возвращает JSON со списком {region_id, region_name, shows, percent}
-    по убыванию показов.
+    Возвращает JSON: {phrase, region_mode, returned_regions,
+    regions:[{region_id, region_name, count(int), share(float),
+    affinity_index(float)}]}.
     """
-    lc = ctx.request_context.lifespan_context
-    direct = resolve_direct_client(account, lc)
-    if direct is None:
-        return _no_direct_error(account)
+    ws = _get_client(ctx)
+    if ws is None:
+        return _no_client_error()
 
     phrase_str = (phrase or "").strip()
     if not phrase_str:
         return json.dumps({"error": "Параметр phrase пуст."}, ensure_ascii=False)
 
-    try:
-        data = await _create_and_poll(direct, [phrase_str], None, client_login)
-    except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-
-    if not data:
+    region_mode = (region or "REGION_ALL").strip().upper()
+    if region_mode not in _REGION_MODES:
         return json.dumps(
-            {"error": f"Wordstat не вернул данных для фразы «{phrase_str}»."},
+            {"error": f"Недопустимый region: «{region_mode}». Допустимо: {', '.join(sorted(_REGION_MODES))}."},
             ensure_ascii=False,
         )
 
-    first = data[0] if isinstance(data[0], dict) else {}
-    geo_list = first.get("GeoList") or []
-    regions: list[dict] = []
-    for g in geo_list:
-        if not isinstance(g, dict):
+    device_list, err = _parse_devices(devices)
+    if err:
+        return json.dumps({"error": err}, ensure_ascii=False)
+
+    try:
+        data = await ws.regions(phrase_str, region=region_mode, devices=device_list)
+    except WordstatAPIError as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    # Маппинг id → название (best-effort: если дерево недоступно, оставим id).
+    region_names: dict[str, str] = {}
+    try:
+        region_names = await ws.get_regions_map()
+    except WordstatAPIError:
+        region_names = {}
+
+    rows: list[dict] = []
+    for r in (data.get("results") or []):
+        if not isinstance(r, dict):
             continue
-        regions.append({
-            "region_id": int(g.get("GeoID") or 0),
-            "region_name": g.get("GeoName") or g.get("RegionName", ""),
-            "shows": int(g.get("Shows") or 0),
-            "percent": round(float(g.get("ShowsPercent") or 0), 2),
+        rid = str(r.get("region", "")).strip()
+        rows.append({
+            "region_id": rid,
+            "region_name": region_names.get(rid, ""),
+            "count": _to_int(r.get("count")),
+            "share": _to_float(r.get("share")),
+            "affinity_index": _to_float(r.get("affinityIndex")),
         })
-    regions.sort(key=lambda x: x["shows"], reverse=True)
-    regions = regions[:limit]
+
+    rows.sort(key=lambda x: x["count"], reverse=True)
+    limit_n = max(1, int(limit or 50))
+    rows = rows[:limit_n]
 
     result: dict = {
-        "account": account or "primary",
-        "phrase": first.get("Phrase", phrase_str),
-        "total_shows": int(first.get("Shows") or 0),
-        "returned_regions": len(regions),
-        "regions": regions,
+        "phrase": phrase_str,
+        "region_mode": region_mode,
+        "devices": device_list or "all_devices",
+        "returned_regions": len(rows),
+        "regions": rows,
     }
     return json.dumps(result, ensure_ascii=False, indent=2)

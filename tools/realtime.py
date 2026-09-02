@@ -13,7 +13,7 @@ import json
 from datetime import datetime
 from typing import Optional
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from app import mcp, resolve_counter
 from metrica_client import MetricaAPIError

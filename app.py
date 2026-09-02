@@ -1,5 +1,5 @@
 """
-Создаёт единственный экземпляр FastMCP-сервера и управляет жизненным циклом
+Создаёт единственный экземпляр MCPServer-сервера и управляет жизненным циклом
 клиентов Yandex Metrica и Yandex Direct.
 
 Этот модуль импортируется из tools/*.py для регистрации инструментов (@mcp.tool()),
@@ -7,7 +7,7 @@
 
 Порядок инициализации:
   1. server.py вызывает load_dotenv()
-  2. server.py импортирует этот модуль → создаётся mcp = FastMCP(...)
+  2. server.py импортирует этот модуль → создаётся mcp = MCPServer(...)
   3. server.py импортирует все модули tools/* → инструменты регистрируются статически
   4. mcp.run() запускает сервер; lifespan открывает клиентов перед первым вызовом
 """
@@ -18,11 +18,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, AsyncExitStack
 from typing import TYPE_CHECKING
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 import settings as cfg
 from metrica_client import MetricaClient
 from direct_client import DirectClient
+from wordstat_client import WordstatClient
 
 if TYPE_CHECKING:
     pass
@@ -65,7 +66,7 @@ def resolve_direct_client(account: str | None, lc: dict) -> "DirectClient | None
 
 
 @asynccontextmanager
-async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
+async def lifespan(server: MCPServer) -> AsyncIterator[dict]:
     """
     Открывает HTTP-клиенты Yandex Metrica и Yandex Direct при старте сервера.
 
@@ -76,6 +77,7 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
         ctx.request_context.lifespan_context["client"]             # MetricaClient
         ctx.request_context.lifespan_context["direct_client"]      # DirectClient (primary)
         ctx.request_context.lifespan_context["direct_clients"]     # dict[alias, DirectClient]
+        ctx.request_context.lifespan_context["wordstat_client"]    # WordstatClient | None
         ctx.request_context.lifespan_context["default_counter_id"]
         ctx.request_context.lifespan_context["counters_map"]
     """
@@ -94,16 +96,27 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
             primary_name = next(iter(direct_clients))
             primary_client = direct_clients[primary_name]
 
+            # Клиент Wordstat (Yandex Cloud Search API v2) — только если заданы
+            # оба env: YANDEX_SEARCH_API_KEY и YANDEX_FOLDER_ID. Иначе None —
+            # инструменты Wordstat сами вернут понятную ошибку, а остальной
+            # сервер продолжает работать.
+            wordstat_client: WordstatClient | None = None
+            if s.search_api_key and s.search_folder_id:
+                wordstat_client = await stack.enter_async_context(
+                    WordstatClient(api_key=s.search_api_key, folder_id=s.search_folder_id)
+                )
+
             yield {
                 "client": metrica_client,
                 "direct_client": primary_client,     # для обратной совместимости
                 "direct_clients": direct_clients,     # все именованные аккаунты
+                "wordstat_client": wordstat_client,   # Search API v2 (Wordstat) или None
                 "default_counter_id": s.metrica_counter_id,
                 "counters_map": s.metrica_counters,
             }
 
 
-mcp = FastMCP(
+mcp = MCPServer(
     name="Яндекс.Метрика + Директ",
     lifespan=lifespan,
 )

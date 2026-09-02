@@ -8,7 +8,7 @@ Yandex Metrica MCP Server — точка входа.
 
 Порядок инициализации:
   1. load_dotenv() загружает .env
-  2. Импорт app.py создаёт mcp = FastMCP(...) с lifespan
+  2. Импорт app.py создаёт mcp = MCPServer(...) с lifespan
   3. Импорт каждого модуля tools/* регистрирует инструменты через @mcp.tool()
      (статическая регистрация — инструменты видны Claude сразу при подключении)
   4. mcp.run() запускает stdio-сервер; lifespan открывает MetricaClient
