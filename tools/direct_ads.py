@@ -9,8 +9,7 @@
 
 from __future__ import annotations
 
-import json
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -54,12 +53,12 @@ _PRIORITY_LABELS: dict[str, str] = {
 }
 
 
-def _no_direct_error(account: str | None = None) -> str:
+def _no_direct_error(account: str | None = None) -> dict[str, Any]:
     msg = "Клиент Яндекс.Директа не инициализирован."
     if account:
         msg += f" Аккаунт «{account}» не найден в YANDEX_DIRECT_ACCOUNTS."
     msg += " Проверьте переменные окружения YANDEX_DIRECT_ACCOUNTS или YANDEX_DIRECT_TOKEN."
-    return json.dumps({"error": msg}, ensure_ascii=False)
+    return {"error": msg}
 
 
 def _parse_ids(raw: str | None, param_name: str) -> tuple[list[int] | None, str | None]:
@@ -81,7 +80,7 @@ async def get_direct_ads(
     statuses: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить список объявлений Яндекс.Директа с текстами, заголовками и статусами.
 
@@ -106,21 +105,18 @@ async def get_direct_ads(
 
     camp_ids, err = _parse_ids(campaign_ids, "campaign_ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     group_ids, err = _parse_ids(adgroup_ids, "adgroup_ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     a_ids, err = _parse_ids(ad_ids, "ad_ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     if not camp_ids and not group_ids and not a_ids:
-        return json.dumps(
-            {"error": "Укажите хотя бы один из параметров: campaign_ids, adgroup_ids или ad_ids."},
-            ensure_ascii=False,
-        )
+        return {"error": "Укажите хотя бы один из параметров: campaign_ids, adgroup_ids или ad_ids."}
 
     # Парсим статусы
     status_list = None
@@ -136,7 +132,7 @@ async def get_direct_ads(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     raw_ads = data.get("result", {}).get("Ads", [])
 
@@ -186,7 +182,7 @@ async def get_direct_ads(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -197,7 +193,7 @@ async def get_direct_adgroups(
     statuses: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить список групп объявлений Яндекс.Директа.
 
@@ -221,17 +217,14 @@ async def get_direct_adgroups(
 
     camp_ids, err = _parse_ids(campaign_ids, "campaign_ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     group_ids, err = _parse_ids(adgroup_ids, "adgroup_ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     if not camp_ids and not group_ids:
-        return json.dumps(
-            {"error": "Укажите хотя бы один из параметров: campaign_ids или adgroup_ids."},
-            ensure_ascii=False,
-        )
+        return {"error": "Укажите хотя бы один из параметров: campaign_ids или adgroup_ids."}
 
     status_list = None
     if statuses:
@@ -245,7 +238,7 @@ async def get_direct_adgroups(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     raw_groups = data.get("result", {}).get("AdGroups", [])
 
@@ -277,7 +270,7 @@ async def get_direct_adgroups(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -288,7 +281,7 @@ async def get_direct_bids(
     keyword_ids: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить текущие ставки по ключевым словам в Яндекс.Директе.
 
@@ -315,15 +308,15 @@ async def get_direct_bids(
 
     camp_ids, err = _parse_ids(campaign_ids, "campaign_ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     group_ids, err = _parse_ids(adgroup_ids, "adgroup_ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     kw_ids, err = _parse_ids(keyword_ids, "keyword_ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         data = await direct.get_bids(
@@ -333,7 +326,7 @@ async def get_direct_bids(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     raw_bids = data.get("result", {}).get("Bids", [])
 
@@ -389,4 +382,4 @@ async def get_direct_bids(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

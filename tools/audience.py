@@ -5,8 +5,7 @@
 
 from __future__ import annotations
 
-import json
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -43,7 +42,7 @@ async def get_audience(
     breakdown: str = "device",
     limit: int = 15,
     counter_id: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить разбивку аудитории сайта по выбранному параметру.
 
@@ -70,10 +69,7 @@ async def get_audience(
     dimension = _DIMENSION_MAP.get(breakdown)
     if not dimension:
         valid = ", ".join(_DIMENSION_MAP.keys())
-        return json.dumps(
-            {"error": f"Неизвестный тип разбивки: «{breakdown}». Допустимые значения: {valid}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неизвестный тип разбивки: «{breakdown}». Допустимые значения: {valid}."}
 
     try:
         data = await client.get_data(
@@ -86,16 +82,13 @@ async def get_audience(
             counter_id=resolved_id,
         )
     except ValueError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
     except MetricaAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     rows = data.get("data", [])
     if not rows:
-        return json.dumps(
-            {"error": f"Нет данных по аудитории ({breakdown}) за период {date_from} — {date_to}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Нет данных по аудитории ({breakdown}) за период {date_from} — {date_to}."}
 
     total_visits = sum(r["metrics"][0] for r in rows if r.get("metrics"))
 
@@ -128,4 +121,4 @@ async def get_audience(
     if "_sampling_warning" in data:
         result["_sampling_warning"] = data["_sampling_warning"]
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

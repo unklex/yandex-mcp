@@ -9,9 +9,8 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -23,7 +22,7 @@ from metrica_client import MetricaAPIError
 async def get_realtime(
     ctx: Context,
     counter_id: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить активность сайта за сегодня с разбивкой по часам.
     Показывает сессии и пользователей по каждому часу текущих суток.
@@ -50,31 +49,25 @@ async def get_realtime(
             counter_id=resolved_id,
         )
     except MetricaAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     time_intervals = data.get("time_intervals", [])
     data_rows = data.get("data", [])
 
     if not time_intervals or not data_rows:
-        return json.dumps(
-            {
-                "error": (
-                    "Нет данных об активности за сегодня. "
-                    "Возможно, статистика ещё не накоплена или счётчик не получал трафик."
-                )
-            },
-            ensure_ascii=False,
-        )
+        return {
+            "error": (
+                "Нет данных об активности за сегодня. "
+                "Возможно, статистика ещё не накоплена или счётчик не получал трафик."
+            )
+        }
 
     # Структура bytime: data[0]["metrics"][metric_index][time_index]
     try:
         visits_by_hour: list = data_rows[0]["metrics"][0]
         users_by_hour: list = data_rows[0]["metrics"][1]
     except (KeyError, IndexError):
-        return json.dumps(
-            {"error": "Не удалось разобрать ответ API bytime. Попробуйте позже."},
-            ensure_ascii=False,
-        )
+        return {"error": "Не удалось разобрать ответ API bytime. Попробуйте позже."}
 
     by_hour = []
     for interval, visits, users in zip(time_intervals, visits_by_hour, users_by_hour):
@@ -103,4 +96,4 @@ async def get_realtime(
         ),
     }
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

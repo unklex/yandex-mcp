@@ -5,8 +5,7 @@
 
 from __future__ import annotations
 
-import json
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -33,7 +32,7 @@ async def compare_periods(
     date_from_b: str,
     date_to_b: str,
     counter_id: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Сравнить метрику между двумя периодами и рассчитать процентное изменение.
 
@@ -63,10 +62,7 @@ async def compare_periods(
 
     if metric not in _METRIC_MAP:
         valid = ", ".join(_METRIC_MAP.keys())
-        return json.dumps(
-            {"error": f"Неизвестная метрика: «{metric}». Допустимые значения: {valid}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неизвестная метрика: «{metric}». Допустимые значения: {valid}."}
 
     api_metric, display_name = _METRIC_MAP[metric]
 
@@ -80,9 +76,9 @@ async def compare_periods(
             counter_id=resolved_id,
         )
     except ValueError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
     except MetricaAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     totals_a = data.get("totals_a", [0])
     totals_b = data.get("totals_b", [0])
@@ -119,4 +115,4 @@ async def compare_periods(
     if "_sampling_warning" in data:
         result["_sampling_warning"] = data["_sampling_warning"]
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

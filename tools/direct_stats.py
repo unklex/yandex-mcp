@@ -9,8 +9,7 @@
 
 from __future__ import annotations
 
-import json
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -60,12 +59,12 @@ def _safe_float(val) -> float:
         return 0.0
 
 
-def _no_direct_error(account: str | None = None) -> str:
+def _no_direct_error(account: str | None = None) -> dict[str, Any]:
     msg = "Клиент Яндекс.Директа не инициализирован."
     if account:
         msg += f" Аккаунт «{account}» не найден в YANDEX_DIRECT_ACCOUNTS."
     msg += " Проверьте переменные окружения YANDEX_DIRECT_ACCOUNTS или YANDEX_DIRECT_TOKEN."
-    return json.dumps({"error": msg}, ensure_ascii=False)
+    return {"error": msg}
 
 
 def _parse_campaign_ids(campaign_ids: str | None) -> tuple[list[int] | None, str | None]:
@@ -88,7 +87,7 @@ async def get_direct_performance(
     campaign_ids: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить сводку эффективности рекламы в Яндекс.Директе:
     клики, показы, расход, CTR, средняя цена клика, конверсии, стоимость конверсии, ROI.
@@ -113,14 +112,11 @@ async def get_direct_performance(
         return _no_direct_error(account)
 
     if date_range not in _VALID_RANGES:
-        return json.dumps(
-            {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."}
 
     parsed_ids, err = _parse_campaign_ids(campaign_ids)
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         rows = await direct.get_report(
@@ -137,13 +133,10 @@ async def get_direct_performance(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     if not rows:
-        return json.dumps(
-            {"error": f"Нет данных за период {date_range}. Возможно, кампании не показывались."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Нет данных за период {date_range}. Возможно, кампании не показывались."}
 
     # Агрегируем totals и группируем по кампаниям
     campaigns_map: dict[str, dict] = {}
@@ -228,7 +221,7 @@ async def get_direct_performance(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -242,7 +235,7 @@ async def get_direct_keywords(
     campaign_ids: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить топ ключевых фраз в Яндекс.Директе по расходу или кликам.
 
@@ -268,19 +261,13 @@ async def get_direct_keywords(
         return _no_direct_error(account)
 
     if date_range not in _VALID_RANGES:
-        return json.dumps(
-            {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."}
     if sort_by not in ("Cost", "Clicks"):
-        return json.dumps(
-            {"error": "Параметр sort_by должен быть 'Cost' (расход) или 'Clicks' (клики)."},
-            ensure_ascii=False,
-        )
+        return {"error": "Параметр sort_by должен быть 'Cost' (расход) или 'Clicks' (клики)."}
 
     parsed_ids, err = _parse_campaign_ids(campaign_ids)
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         rows = await direct.get_report(
@@ -302,13 +289,10 @@ async def get_direct_keywords(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     if not rows:
-        return json.dumps(
-            {"error": f"Нет данных по ключевым фразам за период {date_range}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Нет данных по ключевым фразам за период {date_range}."}
 
     # Оставляем только KEYWORD — без автотаргетов, ретаргетинга и т.п.
     keyword_rows = [r for r in rows if r.get("CriterionType") == "KEYWORD"] or rows
@@ -349,7 +333,7 @@ async def get_direct_keywords(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -363,7 +347,7 @@ async def get_direct_search_queries(
     campaign_ids: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить отчёт по реальным поисковым запросам пользователей, по которым
     показывались объявления (SEARCH_QUERY_PERFORMANCE_REPORT).
@@ -390,19 +374,13 @@ async def get_direct_search_queries(
         return _no_direct_error(account)
 
     if date_range not in _VALID_RANGES:
-        return json.dumps(
-            {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."}
     if sort_by not in ("Cost", "Clicks"):
-        return json.dumps(
-            {"error": "Параметр sort_by должен быть 'Cost' (расход) или 'Clicks' (клики)."},
-            ensure_ascii=False,
-        )
+        return {"error": "Параметр sort_by должен быть 'Cost' (расход) или 'Clicks' (клики)."}
 
     parsed_ids, err = _parse_campaign_ids(campaign_ids)
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         rows = await direct.get_report(
@@ -422,13 +400,10 @@ async def get_direct_search_queries(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     if not rows:
-        return json.dumps(
-            {"error": f"Нет данных по поисковым запросам за период {date_range}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Нет данных по поисковым запросам за период {date_range}."}
 
     queries = []
     for row in rows:
@@ -464,4 +439,4 @@ async def get_direct_search_queries(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

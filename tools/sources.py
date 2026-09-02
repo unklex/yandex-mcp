@@ -5,8 +5,7 @@
 
 from __future__ import annotations
 
-import json
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -33,7 +32,7 @@ async def get_traffic_sources(
     date_to: str,
     limit: int = 10,
     counter_id: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить разбивку трафика по источникам и каналам (органика, прямые,
     реферальные, реклама, соцсети и т.д.) с показателями качества трафика.
@@ -67,16 +66,13 @@ async def get_traffic_sources(
             counter_id=resolved_id,
         )
     except ValueError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
     except MetricaAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     rows = data.get("data", [])
     if not rows:
-        return json.dumps(
-            {"error": f"Нет данных по источникам трафика за период {date_from} — {date_to}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Нет данных по источникам трафика за период {date_from} — {date_to}."}
 
     total_visits = sum(r["metrics"][0] for r in rows if r.get("metrics"))
 
@@ -109,4 +105,4 @@ async def get_traffic_sources(
     if "_sampling_warning" in data:
         result["_sampling_warning"] = data["_sampling_warning"]
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

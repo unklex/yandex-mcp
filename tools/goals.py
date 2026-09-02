@@ -6,8 +6,7 @@
 
 from __future__ import annotations
 
-import json
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -30,7 +29,7 @@ async def get_goals(
     date_from: str,
     date_to: str,
     counter_id: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить список целей счётчика Яндекс.Метрики и их показатели конверсии
     (количество достижений и процент конверсии) за указанный период.
@@ -51,17 +50,11 @@ async def get_goals(
     try:
         goals_data = await client.get_goals_list(counter_id=resolved_id)
     except MetricaAPIError as e:
-        return json.dumps(
-            {"error": f"Ошибка получения списка целей: {e}"},
-            ensure_ascii=False,
-        )
+        return {"error": f"Ошибка получения списка целей: {e}"}
 
     goals = goals_data.get("goals", [])
     if not goals:
-        return json.dumps(
-            {"error": "В счётчике не настроено ни одной цели."},
-            ensure_ascii=False,
-        )
+        return {"error": "В счётчике не настроено ни одной цели."}
 
     # Фаза 2: запрашиваем статистику по первым 10 целям (20 метрик максимум)
     active_goals = goals[:10]
@@ -78,12 +71,9 @@ async def get_goals(
             counter_id=resolved_id,
         )
     except ValueError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
     except MetricaAPIError as e:
-        return json.dumps(
-            {"error": f"Ошибка получения статистики по целям: {e}"},
-            ensure_ascii=False,
-        )
+        return {"error": f"Ошибка получения статистики по целям: {e}"}
 
     totals = stats.get("totals", [])
 
@@ -114,4 +104,4 @@ async def get_goals(
     if "_sampling_warning" in stats:
         result["_sampling_warning"] = stats["_sampling_warning"]
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

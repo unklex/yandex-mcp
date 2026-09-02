@@ -17,9 +17,8 @@
 
 from __future__ import annotations
 
-import json
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -27,12 +26,12 @@ from app import mcp, resolve_direct_client
 from direct_client import DirectAPIError
 
 
-def _no_direct_error(account: str | None = None) -> str:
+def _no_direct_error(account: str | None = None) -> dict[str, Any]:
     msg = "Клиент Яндекс.Директа не инициализирован."
     if account:
         msg += f" Аккаунт «{account}» не найден в YANDEX_DIRECT_ACCOUNTS."
     msg += " Проверьте переменные окружения YANDEX_DIRECT_ACCOUNTS или YANDEX_DIRECT_TOKEN."
-    return json.dumps({"error": msg}, ensure_ascii=False)
+    return {"error": msg}
 
 
 def _parse_ids(raw: str | None, param: str) -> tuple[list[int] | None, str | None]:
@@ -74,7 +73,7 @@ async def get_negative_keyword_sets(
     ids: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить общие наборы минус-фраз (NegativeKeywordSharedSets) в аккаунте
     Яндекс.Директа.
@@ -101,7 +100,7 @@ async def get_negative_keyword_sets(
 
     parsed_ids, err = _parse_ids(ids, "ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     # FieldNames строго из enum Директа: Id, Name, NegativeKeywords, Associated.
     # SharedAccountId — невалидно (код 4000), keyword_count — локальная метрика.
@@ -117,7 +116,7 @@ async def get_negative_keyword_sets(
     try:
         data = await direct._post_negative_kw_sets(payload, client_login=client_login)
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     raw_sets = data.get("result", {}).get("NegativeKeywordSharedSets", []) or []
     sets_out = []
@@ -145,7 +144,7 @@ async def get_negative_keyword_sets(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -155,7 +154,7 @@ async def add_negative_keyword_set(
     keywords: str,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Создать новый общий набор минус-фраз в Яндекс.Директе.
 
@@ -182,11 +181,11 @@ async def add_negative_keyword_set(
         return _no_direct_error(account)
 
     if not name or not name.strip():
-        return json.dumps({"error": "Параметр name обязателен."}, ensure_ascii=False)
+        return {"error": "Параметр name обязателен."}
 
     parsed = _parse_keywords(keywords)
     if not parsed:
-        return json.dumps({"error": "Параметр keywords пуст."}, ensure_ascii=False)
+        return {"error": "Параметр keywords пуст."}
 
     payload = {
         "method": "add",
@@ -200,18 +199,15 @@ async def add_negative_keyword_set(
     try:
         data = await direct._post_negative_kw_sets(payload, client_login=client_login)
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     results = data.get("result", {}).get("AddResults", []) or []
     if not results:
-        return json.dumps({"error": "Нет AddResults в ответе API."}, ensure_ascii=False)
+        return {"error": "Нет AddResults в ответе API."}
 
     first = results[0]
     if first.get("Errors"):
-        return json.dumps(
-            {"error": "Ошибка создания набора минус-фраз.", "details": first["Errors"]},
-            ensure_ascii=False,
-        )
+        return {"error": "Ошибка создания набора минус-фраз.", "details": first["Errors"]}
 
     result: dict = {
         "account": account or "primary",
@@ -227,7 +223,7 @@ async def add_negative_keyword_set(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -238,7 +234,7 @@ async def update_negative_keyword_set(
     keywords: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Изменить общий набор минус-фраз.
 
@@ -270,16 +266,10 @@ async def update_negative_keyword_set(
     if keywords is not None:
         kw_val = _parse_keywords(keywords)
         if not kw_val:
-            return json.dumps(
-                {"error": "Параметр keywords пуст — укажите хотя бы одну фразу или не передавайте этот параметр."},
-                ensure_ascii=False,
-            )
+            return {"error": "Параметр keywords пуст — укажите хотя бы одну фразу или не передавайте этот параметр."}
 
     if not name_val and kw_val is None:
-        return json.dumps(
-            {"error": "Укажите хотя бы один из параметров: name или keywords."},
-            ensure_ascii=False,
-        )
+        return {"error": "Укажите хотя бы один из параметров: name или keywords."}
 
     item: dict = {"Id": int(set_id)}
     updated_fields: list[str] = []
@@ -298,18 +288,15 @@ async def update_negative_keyword_set(
     try:
         data = await direct._post_negative_kw_sets(payload, client_login=client_login)
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     results = data.get("result", {}).get("UpdateResults", []) or []
     if not results:
-        return json.dumps({"error": "Нет UpdateResults в ответе API."}, ensure_ascii=False)
+        return {"error": "Нет UpdateResults в ответе API."}
 
     first = results[0]
     if first.get("Errors"):
-        return json.dumps(
-            {"error": "Ошибка обновления набора.", "details": first["Errors"]},
-            ensure_ascii=False,
-        )
+        return {"error": "Ошибка обновления набора.", "details": first["Errors"]}
 
     result: dict = {
         "account": account or "primary",
@@ -327,7 +314,7 @@ async def update_negative_keyword_set(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -336,7 +323,7 @@ async def delete_negative_keyword_sets(
     ids: str,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Удалить общие наборы минус-фраз по ID.
 
@@ -360,12 +347,9 @@ async def delete_negative_keyword_sets(
 
     parsed_ids, err = _parse_ids(ids, "ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
     if not parsed_ids:
-        return json.dumps(
-            {"error": "Параметр ids обязателен. Укажите ID наборов через запятую."},
-            ensure_ascii=False,
-        )
+        return {"error": "Параметр ids обязателен. Укажите ID наборов через запятую."}
 
     payload = {
         "method": "delete",
@@ -375,7 +359,7 @@ async def delete_negative_keyword_sets(
     try:
         data = await direct._post_negative_kw_sets(payload, client_login=client_login)
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     results = data.get("result", {}).get("DeleteResults", []) or []
     deleted_ids: list[int] = []
@@ -402,4 +386,4 @@ async def delete_negative_keyword_sets(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

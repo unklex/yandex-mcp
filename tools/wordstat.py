@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -49,16 +48,13 @@ _MAX_PHRASES = 10
 # Общие помощники
 # ---------------------------------------------------------------------------
 
-def _no_client_error() -> str:
-    return json.dumps(
-        {
-            "error": "Клиент Wordstat (Yandex Cloud Search API v2) не инициализирован. "
-            "Задайте переменные окружения YANDEX_SEARCH_API_KEY и YANDEX_FOLDER_ID "
-            "(сервисный аккаунт с ролью search-api.webSearch.user и ключом со scope "
-            "yc.search-api.execute)."
-        },
-        ensure_ascii=False,
-    )
+def _no_client_error() -> dict[str, Any]:
+    return {
+        "error": "Клиент Wordstat (Yandex Cloud Search API v2) не инициализирован. "
+        "Задайте переменные окружения YANDEX_SEARCH_API_KEY и YANDEX_FOLDER_ID "
+        "(сервисный аккаунт с ролью search-api.webSearch.user и ключом со scope "
+        "yc.search-api.execute)."
+    }
 
 
 def _get_client(ctx: Context) -> WordstatClient | None:
@@ -130,7 +126,7 @@ async def wordstat_top_requests(
     geo_ids: Optional[str] = None,
     limit: int = 50,
     devices: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Топ похожих поисковых запросов и ассоциаций по фразам (Wordstat, Search API v2).
 
@@ -160,18 +156,15 @@ async def wordstat_top_requests(
 
     parsed_phrases = _parse_csv(phrases)
     if not parsed_phrases:
-        return json.dumps({"error": "Параметр phrases пуст."}, ensure_ascii=False)
+        return {"error": "Параметр phrases пуст."}
     if len(parsed_phrases) > _MAX_PHRASES:
-        return json.dumps(
-            {"error": f"Не более {_MAX_PHRASES} фраз за вызов. Получено: {len(parsed_phrases)}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Не более {_MAX_PHRASES} фраз за вызов. Получено: {len(parsed_phrases)}."}
 
     num_phrases = max(1, min(int(limit or 50), _MAX_NUM_PHRASES))
     regions = _parse_regions(geo_ids)
     device_list, err = _parse_devices(devices)
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     entries: list[dict] = []
     for phrase in parsed_phrases:
@@ -183,7 +176,7 @@ async def wordstat_top_requests(
                 devices=device_list,
             )
         except WordstatAPIError as e:
-            return json.dumps({"error": str(e), "phrase": phrase}, ensure_ascii=False)
+            return {"error": str(e), "phrase": phrase}
 
         results = [
             {"phrase": r.get("phrase", ""), "count": _to_int(r.get("count"))}
@@ -212,7 +205,7 @@ async def wordstat_top_requests(
         "returned_phrases": len(entries),
         "results": entries,
     }
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +304,7 @@ async def wordstat_dynamics(
     to_date: Optional[str] = None,
     geo_ids: Optional[str] = None,
     devices: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Динамика показов фразы по периодам (Wordstat, Search API v2).
 
@@ -347,14 +340,11 @@ async def wordstat_dynamics(
 
     phrase_str = (phrase or "").strip()
     if not phrase_str:
-        return json.dumps({"error": "Параметр phrase пуст."}, ensure_ascii=False)
+        return {"error": "Параметр phrase пуст."}
 
     period = (period or "PERIOD_MONTHLY").strip().upper()
     if period not in _PERIODS:
-        return json.dumps(
-            {"error": f"Недопустимый period: «{period}». Допустимо: {', '.join(sorted(_PERIODS))}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Недопустимый period: «{period}». Допустимо: {', '.join(sorted(_PERIODS))}."}
 
     now = datetime.now(timezone.utc)
     try:
@@ -362,27 +352,24 @@ async def wordstat_dynamics(
             from_dt = _parse_rfc3339(from_date)
             to_dt = _parse_rfc3339(to_date)
         elif from_date or to_date:
-            return json.dumps(
-                {"error": "Задайте и from_date, и to_date одновременно, либо оставьте оба пустыми."},
-                ensure_ascii=False,
-            )
+            return {"error": "Задайте и from_date, и to_date одновременно, либо оставьте оба пустыми."}
         else:
             from_dt, to_dt = _default_window(period, now)
     except ValueError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     if from_dt >= to_dt:
-        return json.dumps({"error": "from_date должна быть раньше to_date."}, ensure_ascii=False)
+        return {"error": "from_date должна быть раньше to_date."}
 
     for which, dt in (("from_date", from_dt), ("to_date", to_dt)):
         align_err = _align_error(period, which, dt)
         if align_err:
-            return json.dumps({"error": align_err}, ensure_ascii=False)
+            return {"error": align_err}
 
     regions = _parse_regions(geo_ids)
     device_list, err = _parse_devices(devices)
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         data = await ws.dynamics(
@@ -394,7 +381,7 @@ async def wordstat_dynamics(
             devices=device_list,
         )
     except WordstatAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     points = [
         {
@@ -424,7 +411,7 @@ async def wordstat_dynamics(
         "dynamics": points,
         "summary": summary,
     }
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +425,7 @@ async def wordstat_regions(
     region: str = "REGION_ALL",
     limit: int = 50,
     devices: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Распределение показов фразы по регионам за последние 30 дней (Search API v2).
 
@@ -469,23 +456,20 @@ async def wordstat_regions(
 
     phrase_str = (phrase or "").strip()
     if not phrase_str:
-        return json.dumps({"error": "Параметр phrase пуст."}, ensure_ascii=False)
+        return {"error": "Параметр phrase пуст."}
 
     region_mode = (region or "REGION_ALL").strip().upper()
     if region_mode not in _REGION_MODES:
-        return json.dumps(
-            {"error": f"Недопустимый region: «{region_mode}». Допустимо: {', '.join(sorted(_REGION_MODES))}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Недопустимый region: «{region_mode}». Допустимо: {', '.join(sorted(_REGION_MODES))}."}
 
     device_list, err = _parse_devices(devices)
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         data = await ws.regions(phrase_str, region=region_mode, devices=device_list)
     except WordstatAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     # Маппинг id → название (best-effort: если дерево недоступно, оставим id).
     region_names: dict[str, str] = {}
@@ -518,4 +502,4 @@ async def wordstat_regions(
         "returned_regions": len(rows),
         "regions": rows,
     }
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

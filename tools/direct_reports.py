@@ -10,8 +10,7 @@
 
 from __future__ import annotations
 
-import json
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -67,12 +66,12 @@ def _safe_float(val) -> float:
         return 0.0
 
 
-def _no_direct_error(account: str | None = None) -> str:
+def _no_direct_error(account: str | None = None) -> dict[str, Any]:
     msg = "Клиент Яндекс.Директа не инициализирован."
     if account:
         msg += f" Аккаунт «{account}» не найден в YANDEX_DIRECT_ACCOUNTS."
     msg += " Проверьте переменные окружения YANDEX_DIRECT_ACCOUNTS или YANDEX_DIRECT_TOKEN."
-    return json.dumps({"error": msg}, ensure_ascii=False)
+    return {"error": msg}
 
 
 def _parse_campaign_ids(campaign_ids: str | None) -> tuple[list[int] | None, str | None]:
@@ -94,7 +93,7 @@ async def get_direct_stats_by_day(
     campaign_ids: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить динамику рекламы Яндекс.Директа по дням: клики, показы, расход, CTR, CPC.
 
@@ -117,14 +116,11 @@ async def get_direct_stats_by_day(
         return _no_direct_error(account)
 
     if date_range not in _VALID_RANGES:
-        return json.dumps(
-            {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."}
 
     parsed_ids, err = _parse_campaign_ids(campaign_ids)
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         rows = await direct.get_report(
@@ -138,10 +134,10 @@ async def get_direct_stats_by_day(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     if not rows:
-        return json.dumps({"error": f"Нет данных за период {date_range}."}, ensure_ascii=False)
+        return {"error": f"Нет данных за период {date_range}."}
 
     days = []
     for row in rows:
@@ -178,7 +174,7 @@ async def get_direct_stats_by_day(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -191,7 +187,7 @@ async def get_direct_stats_by_region(
     top_n: int = 20,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить статистику рекламы Яндекс.Директа по регионам/городам.
 
@@ -216,14 +212,11 @@ async def get_direct_stats_by_region(
         return _no_direct_error(account)
 
     if date_range not in _VALID_RANGES:
-        return json.dumps(
-            {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."}
 
     parsed_ids, err = _parse_campaign_ids(campaign_ids)
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         rows = await direct.get_report(
@@ -241,10 +234,10 @@ async def get_direct_stats_by_region(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     if not rows:
-        return json.dumps({"error": f"Нет данных по регионам за период {date_range}."}, ensure_ascii=False)
+        return {"error": f"Нет данных по регионам за период {date_range}."}
 
     regions = []
     for row in rows:
@@ -278,7 +271,7 @@ async def get_direct_stats_by_region(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -290,7 +283,7 @@ async def get_direct_stats_by_device(
     campaign_ids: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить статистику рекламы Яндекс.Директа по устройствам (desktop/mobile/tablet).
 
@@ -314,14 +307,11 @@ async def get_direct_stats_by_device(
         return _no_direct_error(account)
 
     if date_range not in _VALID_RANGES:
-        return json.dumps(
-            {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."}
 
     parsed_ids, err = _parse_campaign_ids(campaign_ids)
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         rows = await direct.get_report(
@@ -334,10 +324,10 @@ async def get_direct_stats_by_device(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     if not rows:
-        return json.dumps({"error": f"Нет данных по устройствам за период {date_range}."}, ensure_ascii=False)
+        return {"error": f"Нет данных по устройствам за период {date_range}."}
 
     devices = []
     for row in rows:
@@ -370,7 +360,7 @@ async def get_direct_stats_by_device(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -382,7 +372,7 @@ async def get_direct_stats_by_placement(
     campaign_ids: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить статистику рекламы Яндекс.Директа по типу площадки: поиск vs РСЯ.
 
@@ -406,14 +396,11 @@ async def get_direct_stats_by_placement(
         return _no_direct_error(account)
 
     if date_range not in _VALID_RANGES:
-        return json.dumps(
-            {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."}
 
     parsed_ids, err = _parse_campaign_ids(campaign_ids)
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         rows = await direct.get_report(
@@ -429,10 +416,10 @@ async def get_direct_stats_by_placement(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     if not rows:
-        return json.dumps({"error": f"Нет данных по площадкам за период {date_range}."}, ensure_ascii=False)
+        return {"error": f"Нет данных по площадкам за период {date_range}."}
 
     placements = []
     for row in rows:
@@ -466,4 +453,4 @@ async def get_direct_stats_by_placement(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

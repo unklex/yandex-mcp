@@ -5,8 +5,7 @@
 
 from __future__ import annotations
 
-import json
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -20,7 +19,7 @@ async def get_traffic_summary(
     date_from: str,
     date_to: str,
     counter_id: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить общую сводку трафика сайта за указанный период:
     сессии, уникальные пользователи, просмотры страниц, показатель отказов,
@@ -52,16 +51,13 @@ async def get_traffic_summary(
             counter_id=int(resolved_id),
         )
     except ValueError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
     except MetricaAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     totals = data.get("totals", [])
     if not totals:
-        return json.dumps(
-            {"error": f"Нет данных за период {date_from} — {date_to}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Нет данных за период {date_from} — {date_to}."}
 
     visits, users, pageviews, bounce_rate, avg_duration = (list(totals) + [0] * 5)[:5]
 
@@ -80,4 +76,4 @@ async def get_traffic_summary(
     if "_sampling_warning" in data:
         result["_sampling_warning"] = data["_sampling_warning"]
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

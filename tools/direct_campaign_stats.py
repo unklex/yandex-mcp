@@ -14,9 +14,8 @@ polling-модель Reports API (201/202 → retryIn → 200), фильтр п�
 
 from __future__ import annotations
 
-import json
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -68,12 +67,12 @@ _SUGGESTED_FIELDS: dict[str, str] = {
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def _no_direct_error(account: str | None = None) -> str:
+def _no_direct_error(account: str | None = None) -> dict[str, Any]:
     msg = "Клиент Яндекс.Директа не инициализирован."
     if account:
         msg += f" Аккаунт «{account}» не найден в YANDEX_DIRECT_ACCOUNTS."
     msg += " Проверьте переменные окружения YANDEX_DIRECT_ACCOUNTS или YANDEX_DIRECT_TOKEN."
-    return json.dumps({"error": msg}, ensure_ascii=False)
+    return {"error": msg}
 
 
 def _parse_ids(raw: str | None, param: str) -> tuple[list[int] | None, str | None]:
@@ -122,7 +121,7 @@ async def get_campaign_stats(
     include_vat: bool = True,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить детальную статистику по указанным кампаниям Яндекс.Директа
     за произвольный период (CAMPAIGN_PERFORMANCE_REPORT).
@@ -153,23 +152,14 @@ async def get_campaign_stats(
 
     parsed_ids, err = _parse_ids(campaign_ids, "campaign_ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
     if not parsed_ids:
-        return json.dumps(
-            {"error": "Параметр campaign_ids обязателен. Укажите хотя бы один ID."},
-            ensure_ascii=False,
-        )
+        return {"error": "Параметр campaign_ids обязателен. Укажите хотя бы один ID."}
 
     if not _DATE_RE.match(date_from or ""):
-        return json.dumps(
-            {"error": f"Неверный формат date_from: «{date_from}». Ожидается YYYY-MM-DD."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный формат date_from: «{date_from}». Ожидается YYYY-MM-DD."}
     if not _DATE_RE.match(date_to or ""):
-        return json.dumps(
-            {"error": f"Неверный формат date_to: «{date_to}». Ожидается YYYY-MM-DD."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный формат date_to: «{date_to}». Ожидается YYYY-MM-DD."}
 
     try:
         rows = await direct.get_report(
@@ -190,13 +180,10 @@ async def get_campaign_stats(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     if not rows:
-        return json.dumps(
-            {"error": f"Нет данных за период {date_from} — {date_to} по указанным кампаниям."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Нет данных за период {date_from} — {date_to} по указанным кампаниям."}
 
     # Агрегируем totals в сырых единицах (микро-рубли, целые клики),
     # конвертируем в конце — избегает накопления ошибок округления.
@@ -244,7 +231,7 @@ async def get_campaign_stats(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -258,7 +245,7 @@ async def get_custom_report(
     limit: int = 500,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Запустить произвольный отчёт Яндекс.Директа через Reports API.
     Гибкий универсальный инструмент для случаев, не покрытых специализированными.
@@ -304,36 +291,24 @@ async def get_custom_report(
 
     rt = (report_type or "").strip().upper()
     if rt not in _VALID_REPORT_TYPES:
-        return json.dumps(
-            {
-                "error": f"Неверный report_type: «{report_type}». "
-                         f"Допустимые: {', '.join(sorted(_VALID_REPORT_TYPES))}.",
-            },
-            ensure_ascii=False,
-        )
+        return {
+            "error": f"Неверный report_type: «{report_type}». "
+            f"Допустимые: {', '.join(sorted(_VALID_REPORT_TYPES))}.",
+        }
 
     parsed_fields = _parse_fields(fields)
     if not parsed_fields:
         hint = _SUGGESTED_FIELDS.get(rt, "")
-        return json.dumps(
-            {"error": f"Параметр fields пуст. Пример полей для {rt}: {hint}"},
-            ensure_ascii=False,
-        )
+        return {"error": f"Параметр fields пуст. Пример полей для {rt}: {hint}"}
 
     if not _DATE_RE.match(date_from or ""):
-        return json.dumps(
-            {"error": f"Неверный формат date_from: «{date_from}». Ожидается YYYY-MM-DD."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный формат date_from: «{date_from}». Ожидается YYYY-MM-DD."}
     if not _DATE_RE.match(date_to or ""):
-        return json.dumps(
-            {"error": f"Неверный формат date_to: «{date_to}». Ожидается YYYY-MM-DD."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный формат date_to: «{date_to}». Ожидается YYYY-MM-DD."}
 
     parsed_ids, err = _parse_ids(campaign_ids, "campaign_ids")
     if err:
-        return json.dumps({"error": err}, ensure_ascii=False)
+        return {"error": err}
 
     try:
         rows = await direct.get_report(
@@ -348,7 +323,7 @@ async def get_custom_report(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     formatted_rows = [{k: _fmt_val(k, v) for k, v in r.items()} for r in rows]
 
@@ -372,4 +347,4 @@ async def get_custom_report(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

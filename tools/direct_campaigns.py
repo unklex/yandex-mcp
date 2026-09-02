@@ -10,9 +10,8 @@
 
 from __future__ import annotations
 
-import json
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -68,12 +67,12 @@ def format_metrics(row: dict[str, str]) -> dict[str, float | str]:
     return result
 
 
-def _no_direct_error(account: str | None = None) -> str:
+def _no_direct_error(account: str | None = None) -> dict[str, Any]:
     msg = "Клиент Яндекс.Директа не инициализирован."
     if account:
         msg += f" Аккаунт «{account}» не найден в YANDEX_DIRECT_ACCOUNTS."
     msg += " Проверьте переменные окружения YANDEX_DIRECT_ACCOUNTS или YANDEX_DIRECT_TOKEN."
-    return json.dumps({"error": msg}, ensure_ascii=False)
+    return {"error": msg}
 
 
 @mcp.tool()
@@ -81,7 +80,7 @@ async def get_direct_campaigns(
     ctx: Context,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить список рекламных кампаний в Яндекс.Директе:
     ID, название, статус (на русском), состояние, дневной бюджет в рублях.
@@ -103,7 +102,7 @@ async def get_direct_campaigns(
     try:
         data = await direct.get_campaigns(client_login=client_login)
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     raw_campaigns = data.get("result", {}).get("Campaigns", [])
 
@@ -134,7 +133,7 @@ async def get_direct_campaigns(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -147,7 +146,7 @@ async def get_direct_top_campaigns(
     date_to: Optional[str] = None,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить топ-N рекламных кампаний Яндекс.Директа по расходу или кликам за период.
 
@@ -172,15 +171,9 @@ async def get_direct_top_campaigns(
         return _no_direct_error(account)
 
     if sort_by not in ("Cost", "Clicks"):
-        return json.dumps(
-            {"error": "Параметр sort_by должен быть 'Cost' (расход) или 'Clicks' (клики)."},
-            ensure_ascii=False,
-        )
+        return {"error": "Параметр sort_by должен быть 'Cost' (расход) или 'Clicks' (клики)."}
     if date_range not in _VALID_RANGES:
-        return json.dumps(
-            {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Неверный date_range: «{date_range}». Допустимые: {', '.join(sorted(_VALID_RANGES))}."}
 
     try:
         rows = await direct.get_report(
@@ -194,13 +187,10 @@ async def get_direct_top_campaigns(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     if not rows:
-        return json.dumps(
-            {"error": f"Нет данных по кампаниям за период {date_range}. Возможно, не было показов."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Нет данных по кампаниям за период {date_range}. Возможно, не было показов."}
 
     campaigns = []
     for row in rows:
@@ -233,7 +223,7 @@ async def get_direct_top_campaigns(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -241,7 +231,7 @@ async def get_direct_budget(
     ctx: Context,
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить сводку по бюджетам кампаний Яндекс.Директа и остатку баллов API.
 
@@ -267,7 +257,7 @@ async def get_direct_budget(
     try:
         data = await direct.get_campaigns(client_login=client_login)
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     raw_campaigns = data.get("result", {}).get("Campaigns", [])
     active = [c for c in raw_campaigns if c.get("Status") == "ON"]
@@ -306,7 +296,7 @@ async def get_direct_budget(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -317,7 +307,7 @@ async def add_direct_negative_keywords(
     mode: str = "append",
     account: Optional[str] = None,
     client_login: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Добавить или заменить минус-фразы на уровне рекламной кампании Яндекс.Директа.
 
@@ -349,10 +339,7 @@ async def add_direct_negative_keywords(
         return _no_direct_error(account)
 
     if mode not in ("append", "replace"):
-        return json.dumps(
-            {"error": f"Параметр mode должен быть 'append' или 'replace', получено: «{mode}»."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Параметр mode должен быть 'append' или 'replace', получено: «{mode}»."}
 
     # Разбор фраз: поддерживаем и запятые, и точки с запятой. Пустые — отбрасываем,
     # дубли внутри входа — тоже (первое вхождение).
@@ -370,10 +357,7 @@ async def add_direct_negative_keywords(
         parsed.append(s)
 
     if not parsed:
-        return json.dumps(
-            {"error": "Параметр keywords пуст. Укажите минус-фразы через запятую."},
-            ensure_ascii=False,
-        )
+        return {"error": "Параметр keywords пуст. Укажите минус-фразы через запятую."}
 
     try:
         summary = await direct.set_campaign_negative_keywords(
@@ -383,7 +367,7 @@ async def add_direct_negative_keywords(
             client_login=client_login,
         )
     except DirectAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     result: dict = {
         "account": account or "primary",
@@ -394,4 +378,4 @@ async def add_direct_negative_keywords(
     if warning:
         result["_units_warning"] = warning
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

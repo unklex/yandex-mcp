@@ -15,8 +15,7 @@
 
 from __future__ import annotations
 
-import json
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context
 
@@ -31,7 +30,7 @@ async def get_top_pages(
     date_to: str,
     limit: int = 20,
     counter_id: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Получить топ страниц входа по количеству визитов с показателем отказов
     и средним временем на сайте.
@@ -68,16 +67,13 @@ async def get_top_pages(
             counter_id=resolved_id,
         )
     except ValueError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
     except MetricaAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return {"error": str(e)}
 
     rows = data.get("data", [])
     if not rows:
-        return json.dumps(
-            {"error": f"Нет данных по страницам за период {date_from} — {date_to}."},
-            ensure_ascii=False,
-        )
+        return {"error": f"Нет данных по страницам за период {date_from} — {date_to}."}
 
     pages = []
     for row in rows:
@@ -104,4 +100,4 @@ async def get_top_pages(
     if "_sampling_warning" in data:
         result["_sampling_warning"] = data["_sampling_warning"]
 
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
